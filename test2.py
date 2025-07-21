@@ -744,13 +744,13 @@ if __name__ == "__main__":
 '''
 
 # =============================================================================
-# 파일 3: run_separated.py (통합 실행기)
+# 파일 3: run_separated.py (통합 실행기) - IMPROVED VERSION
 # =============================================================================
 
 RUN_SEPARATED_CODE = '''#!/usr/bin/env python3
 """
-Separated Process Runner
-DPU와 웹서버를 별도 프로세스로 실행
+Separated Process Runner - IMPROVED VERSION
+DPU와 웹서버를 별도 프로세스로 실행 (개선된 프로세스 모니터링)
 """
 
 import subprocess
@@ -789,73 +789,148 @@ def main():
     
     # Start DPU worker
     print("1. Starting DPU worker process...")
-    dpu_process = subprocess.Popen([
-        sys.executable, "dpu_worker.py", 
-        "--model", "yolox_nano_pt.xmodel"
-    ])
+    try:
+        dpu_process = subprocess.Popen([
+            sys.executable, "dpu_worker.py", 
+            "--model", "yolox_nano_pt.xmodel"
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except Exception as e:
+        print(f"❌ Failed to start DPU worker: {e}")
+        return
     
-    # Wait for DPU to be ready
+    # Wait for DPU to be ready with better monitoring
     print("2. Waiting for DPU worker to be ready...")
     timeout = 30
     start_time = time.time()
     
     while time.time() - start_time < timeout:
+        # Check if process is still alive
+        if dpu_process.poll() is not None:
+            print("❌ DPU worker process exited during startup")
+            print("DPU worker output:")
+            try:
+                stdout, stderr = dpu_process.communicate()
+                if stdout:
+                    print(stdout)
+            except:
+                print("Could not get DPU worker output")
+            return
+        
+        # Check for ready status
         if os.path.exists("/tmp/dpu_status.txt"):
             print("✅ DPU worker is ready!")
             break
+        
         time.sleep(1)
     else:
         print("❌ DPU worker failed to start within timeout")
+        print("Checking DPU worker output...")
+        if dpu_process.poll() is None:
+            dpu_process.terminate()
+            time.sleep(2)
+        try:
+            stdout, stderr = dpu_process.communicate()
+            if stdout:
+                print("DPU worker output:")
+                print(stdout)
+        except:
+            print("Could not get DPU worker output")
         cleanup()
         return
     
     # Start web streamer
     print("3. Starting web streamer process...")
-    web_process = subprocess.Popen([
-        sys.executable, "web_streamer.py",
-        "--camera", "0",
-        "--host", "0.0.0.0", 
-        "--port", "5000"
-    ])
+    try:
+        web_process = subprocess.Popen([
+            sys.executable, "web_streamer.py",
+            "--camera", "0",
+            "--host", "0.0.0.0", 
+            "--port", "5000"
+        ])
+    except Exception as e:
+        print(f"❌ Failed to start web streamer: {e}")
+        dpu_process.terminate()
+        cleanup()
+        return
     
     print("\\n🚀 System started successfully!")
     print("📱 Web interface: http://YOUR_IP:5000")
     print("🔄 DPU and Web processes are completely separated")
+    print("\\n📊 Process Status:")
+    print(f"  DPU Worker PID: {dpu_process.pid}")
+    print(f"  Web Streamer PID: {web_process.pid}")
     print("\\nPress Ctrl+C to stop all processes")
     
     try:
-        # Monitor processes
+        # Improved process monitoring
+        check_interval = 5  # Check every 5 seconds instead of every second
+        last_check = time.time()
+        
         while True:
-            if dpu_process.poll() is not None:
-                print("❌ DPU worker process died")
-                break
-            if web_process.poll() is not None:
-                print("❌ Web streamer process died")
-                break
+            current_time = time.time()
+            
+            # Check processes less frequently to avoid false positives
+            if current_time - last_check >= check_interval:
+                dpu_status = dpu_process.poll()
+                web_status = web_process.poll()
+                
+                if dpu_status is not None:
+                    print(f"❌ DPU worker process died (exit code: {dpu_status})")
+                    print("Getting DPU worker output...")
+                    try:
+                        # Try to get any remaining output
+                        remaining_output = dpu_process.stdout.read() if dpu_process.stdout else "No output available"
+                        if remaining_output:
+                            print("DPU worker final output:")
+                            print(remaining_output)
+                    except:
+                        print("Could not get remaining output")
+                    break
+                
+                if web_status is not None:
+                    print(f"❌ Web streamer process died (exit code: {web_status})")
+                    break
+                
+                # Print status every 30 seconds
+                if int(current_time) % 30 == 0:
+                    print(f"✅ Both processes running (DPU: {dpu_process.pid}, Web: {web_process.pid})")
+                
+                last_check = current_time
+            
             time.sleep(1)
     
     except KeyboardInterrupt:
-        pass
+        print("\\n🛑 User requested shutdown")
     
     finally:
-        print("\\nStopping processes...")
+        print("\\n⏳ Stopping processes...")
         try:
-            dpu_process.terminate()
-            web_process.terminate()
+            # Graceful shutdown
+            if dpu_process.poll() is None:
+                print("  Stopping DPU worker...")
+                dpu_process.terminate()
+            
+            if web_process.poll() is None:
+                print("  Stopping web streamer...")
+                web_process.terminate()
             
             # Wait for graceful shutdown
             try:
-                dpu_process.wait(timeout=5)
-                web_process.wait(timeout=5)
+                if dpu_process.poll() is None:
+                    dpu_process.wait(timeout=5)
+                if web_process.poll() is None:
+                    web_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                print("Force killing processes...")
-                dpu_process.kill()
-                web_process.kill()
-        except:
-            pass
+                print("  Force killing processes...")
+                if dpu_process.poll() is None:
+                    dpu_process.kill()
+                if web_process.poll() is None:
+                    web_process.kill()
+        except Exception as e:
+            print(f"Error during shutdown: {e}")
         
         cleanup()
-        print("✅ All processes stopped")
+        print("✅ All processes stopped cleanly")
 
 if __name__ == "__main__":
     main()
