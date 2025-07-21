@@ -1,270 +1,343 @@
 #!/usr/bin/env python3
 """
-Safe Web Streamer - DPU 호출 완전 비활성화 버전
-segfault 원인을 찾기 위한 테스트 버전
+Debug DPU Worker - 더미 데이터만 사용하여 segfault 원인 격리
 """
 
-import cv2
-import numpy as np
 import time
+import numpy as np
+import gc
 import json
 import os
-import threading
-from flask import Flask, Response, render_template_string
+import sys
 
-class SafeWebStreamer:
-    def __init__(self, camera_id=0):
-        self.camera_id = camera_id
+try:
+    import vart
+    import xir
+    import cv2
+except ImportError as e:
+    print(f"Import error: {e}")
+    sys.exit(1)
+
+class DebugDPUWorker:
+    def __init__(self, model_path):
+        self.model_path = model_path
+        self.dpu_runner = None
+        self.input_tensors = None
+        self.output_tensors = None
         
-        # Flask app
-        self.app = Flask(__name__)
-        
-        # Communication files (하지만 사용하지 않음)
+        # Communication files
         self.input_file = "/tmp/dpu_input.jpg"
         self.result_file = "/tmp/dpu_result.json"
         self.status_file = "/tmp/dpu_status.txt"
         
-        # Camera
-        self.cap = None
-        self.is_running = False
-        self.current_frame = None
-        self.frame_lock = threading.Lock()
+        # Test modes
+        self.test_mode = "dummy"  # "dummy", "file", "real"
         
-        # Fake DPU results (실제 DPU 호출 안 함)
-        self.fake_detections = 0
-        self.fake_inference_time = 0.1
+        # Load model
+        self._load_model()
         
-        # Stats
-        self.frame_count = 0
-        self.start_time = time.time()
+        # Write status
+        with open(self.status_file, 'w') as f:
+            f.write("DPU_READY")
         
-        self.setup_routes()
+        print("Debug DPU Worker ready")
     
-    def setup_routes(self):
-        @self.app.route('/')
-        def index():
-            return render_template_string("""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>🧪 Safe Web Streamer (No DPU)</title>
-    <style>
-        body { 
-            font-family: Arial, sans-serif; 
-            margin: 20px; 
-            background: #1a1a1a;
-            color: white;
-            text-align: center;
-        }
-        .container { 
-            max-width: 1000px; 
-            margin: 0 auto; 
-            padding: 20px;
-        }
-        .stats { 
-            display: flex; 
-            justify-content: space-around; 
-            margin: 20px 0;
-            background: rgba(255,255,255,0.1);
-            padding: 15px;
-            border-radius: 10px;
-        }
-        .stat-item { 
-            text-align: center;
-        }
-        .stat-value { 
-            font-size: 24px; 
-            font-weight: bold; 
-            color: #ff6b6b;
-        }
-        .stat-label { 
-            font-size: 14px; 
-            color: #ccc;
-        }
-        img { 
-            max-width: 100%; 
-            border: 2px solid #ff6b6b;
-            border-radius: 10px;
-        }
-        .test-mode {
-            background: rgba(255,107,107,0.2);
-            padding: 10px;
-            border-radius: 8px;
-            margin: 20px 0;
-            color: #ff6b6b;
-            font-weight: bold;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🧪 Safe Web Streamer</h1>
-        
-        <div class="test-mode">
-            ⚠️ TEST MODE: DPU calls completely disabled to isolate segfault cause
-        </div>
-        
-        <div class="stats">
-            <div class="stat-item">
-                <div class="stat-value" id="fps">--</div>
-                <div class="stat-label">Camera FPS</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value" id="detections">FAKE</div>
-                <div class="stat-label">Detections</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value" id="inference-time">N/A</div>
-                <div class="stat-label">DPU Time (ms)</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value" id="status">🔴</div>
-                <div class="stat-label">DPU Status</div>
-            </div>
-        </div>
-        
-        <img src="/video_feed" alt="Camera Stream" />
-        
-        <div class="test-mode">
-            If this runs without segfault, the issue is in DPU worker process
-        </div>
-    </div>
-
-    <script>
-        function updateStats() {
-            fetch('/stats')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('fps').textContent = data.fps.toFixed(1);
-                    document.getElementById('detections').textContent = 'FAKE';
-                    document.getElementById('inference-time').textContent = 'N/A';
-                    document.getElementById('status').textContent = '🔴';
-                })
-                .catch(error => console.error('Error:', error));
-        }
-        
-        setInterval(updateStats, 1000);
-        updateStats();
-    </script>
-</body>
-</html>
-            """)
-        
-        @self.app.route('/video_feed')
-        def video_feed():
-            return Response(self.generate_frames(),
-                           mimetype='multipart/x-mixed-replace; boundary=frame')
-        
-        @self.app.route('/stats')
-        def stats():
-            current_time = time.time()
-            elapsed_time = current_time - self.start_time
-            fps = self.frame_count / elapsed_time if elapsed_time > 0 else 0
+    def _load_model(self):
+        """Load DPU model - COMPLETE version from previous success"""
+        try:
+            graph = xir.Graph.deserialize(self.model_path)
+            root_subgraph = graph.get_root_subgraph()
             
+            if root_subgraph is None:
+                raise ValueError("Failed to get root subgraph")
+            
+            # Get subgraphs with FULL compatibility
+            subgraphs = []
+            try:
+                if hasattr(root_subgraph, 'children_topological_sort'):
+                    children = root_subgraph.children_topological_sort()
+                    if isinstance(children, (list, tuple)):
+                        subgraphs = children
+                    elif isinstance(children, set):
+                        subgraphs = list(children)
+                    else:
+                        subgraphs = [children] if children else []
+                else:
+                    subgraphs = [root_subgraph]
+            except:
+                subgraphs = [root_subgraph]
+            
+            # Find DPU subgraph with all methods
+            dpu_subgraph = None
+            
+            # Method 1: Device attribute
+            for i, sg in enumerate(subgraphs):
+                if sg is None:
+                    continue
+                try:
+                    if sg.has_attr("device"):
+                        device = sg.get_attr("device")
+                        if isinstance(device, str) and device.upper() == "DPU":
+                            dpu_subgraph = sg
+                            print(f"Found DPU by device at index {i}")
+                            break
+                except:
+                    continue
+            
+            # Method 2: Validation test
+            if dpu_subgraph is None:
+                for i, sg in enumerate(subgraphs):
+                    if sg is None:
+                        continue
+                    try:
+                        name = sg.get_name()
+                        if name != "root":
+                            test_runner = vart.Runner.create_runner(sg, "run")
+                            if test_runner is not None:
+                                dpu_subgraph = sg
+                                print(f"Found DPU by validation at index {i}")
+                                break
+                    except:
+                        continue
+            
+            if dpu_subgraph is None:
+                raise ValueError("No DPU subgraph found")
+            
+            # Create runner
+            self.dpu_runner = vart.Runner.create_runner(dpu_subgraph, "run")
+            self.input_tensors = self.dpu_runner.get_input_tensors()
+            self.output_tensors = self.dpu_runner.get_output_tensors()
+            
+            print("✅ Debug DPU loaded successfully")
+            
+        except Exception as e:
+            print(f"Debug DPU model loading failed: {e}")
+            sys.exit(1)
+    
+    def create_dummy_data(self):
+        """Create dummy data like successful minimal_dpu_test.py"""
+        try:
+            input_shape = tuple(self.input_tensors[0].dims)  # (1, 416, 416, 3)
+            
+            # Method that worked in minimal_dpu_test.py
+            dummy_data = np.random.randint(-128, 127, input_shape, dtype=np.int8)
+            dummy_data = np.ascontiguousarray(dummy_data)
+            
+            print(f"Created dummy data: {dummy_data.shape}, {dummy_data.dtype}")
+            return dummy_data
+            
+        except Exception as e:
+            print(f"Error creating dummy data: {e}")
+            return None
+    
+    def process_with_dummy_data(self):
+        """Process using dummy data (known to work)"""
+        try:
+            print("🧪 Testing with DUMMY data (like minimal_dpu_test.py)")
+            start_time = time.time()
+            
+            # Create dummy input (proven method)
+            input_data = self.create_dummy_data()
+            if input_data is None:
+                return {"success": False, "error": "Failed to create dummy data"}
+            
+            # Prepare outputs (proven method)
+            output_arrays = []
+            for tensor in self.output_tensors:
+                shape = tuple(tensor.dims)
+                output_array = np.zeros(shape, dtype=np.float32)
+                output_array = np.ascontiguousarray(output_array)
+                output_arrays.append(output_array)
+            
+            # Clear memory (proven method)
+            gc.collect()
+            
+            print(">>> DPU inference with DUMMY data <<<")
+            
+            # DPU inference (exact proven method)
+            job_id = self.dpu_runner.execute_async([input_data], output_arrays)
+            self.dpu_runner.wait(job_id)
+            
+            print(">>> DPU inference with DUMMY data completed <<<")
+            
+            # Simple count
+            detection_count = 0
+            for output in output_arrays:
+                if len(output.shape) == 4 and output.shape[-1] >= 85:
+                    objectness = output[0, :, :, 4]
+                    detection_count += np.sum(objectness > 0.3)
+            
+            inference_time = time.time() - start_time
+            
+            result = {
+                "success": True,
+                "detections": min(int(detection_count), 50),
+                "inference_time": float(inference_time),
+                "method": "dummy_data",
+                "timestamp": time.time()
+            }
+            
+            print(f"✅ DUMMY data test SUCCESS: {result}")
+            return result
+            
+        except Exception as e:
+            print(f"❌ DUMMY data test FAILED: {e}")
+            import traceback
+            traceback.print_exc()
             return {
-                'fps': fps,
-                'detections': 'DISABLED',
-                'inference_time': 0,
-                'dpu_status': False
+                "success": False,
+                "error": f"Dummy test failed: {str(e)}",
+                "method": "dummy_data",
+                "timestamp": time.time()
             }
     
-    def start_camera(self):
-        self.cap = cv2.VideoCapture(self.camera_id)
-        if not self.cap.isOpened():
-            print("Cannot open camera")
-            return False
-        
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.is_running = True
-        self.start_time = time.time()
-        
-        print("Camera started (SAFE MODE - NO DPU)")
-        return True
+    def process_real_image(self, image_path):
+        """Process real image (this is where segfault likely occurs)"""
+        try:
+            print("🖼️ Testing with REAL image data")
+            
+            # Read image
+            frame = cv2.imread(image_path)
+            if frame is None:
+                return {"success": False, "error": "Could not read image"}
+            
+            print(f"Read real image: {frame.shape}, {frame.dtype}")
+            start_time = time.time()
+            
+            # Preprocess (proven Method 2)
+            img_h, img_w = frame.shape[:2]
+            scale = min(416 / img_w, 416 / img_h)
+            new_w, new_h = int(img_w * scale), int(img_h * scale)
+            
+            print(f"Resizing: {img_w}x{img_h} -> {new_w}x{new_h}")
+            resized = cv2.resize(frame, (new_w, new_h))
+            
+            print("Creating padded array...")
+            padded = np.full((416, 416, 3), 114, dtype=np.uint8)
+            pad_x = (416 - new_w) // 2
+            pad_y = (416 - new_h) // 2
+            padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
+            
+            print("Converting to int8...")
+            # Convert to int8 (proven method)
+            input_data = (padded.astype(np.int16) - 128).astype(np.int8)
+            input_data = np.expand_dims(input_data, axis=0)
+            input_data = np.ascontiguousarray(input_data)
+            
+            print(f"Preprocessed real image: {input_data.shape}, {input_data.dtype}, range=[{input_data.min()}, {input_data.max()}]")
+            
+            # Prepare outputs
+            output_arrays = []
+            for tensor in self.output_tensors:
+                shape = tuple(tensor.dims)
+                output_array = np.zeros(shape, dtype=np.float32)
+                output_array = np.ascontiguousarray(output_array)
+                output_arrays.append(output_array)
+            
+            # Clear memory
+            gc.collect()
+            
+            print(">>> DPU inference with REAL image <<<")
+            
+            # DPU inference (proven method)
+            job_id = self.dpu_runner.execute_async([input_data], output_arrays)
+            self.dpu_runner.wait(job_id)
+            
+            print(">>> DPU inference with REAL image completed <<<")
+            
+            # Count detections
+            detection_count = 0
+            for output in output_arrays:
+                if len(output.shape) == 4 and output.shape[-1] >= 85:
+                    objectness = output[0, :, :, 4]
+                    detection_count += np.sum(objectness > 0.3)
+            
+            inference_time = time.time() - start_time
+            
+            result = {
+                "success": True,
+                "detections": min(int(detection_count), 50),
+                "inference_time": float(inference_time),
+                "method": "real_image",
+                "timestamp": time.time()
+            }
+            
+            print(f"✅ REAL image test SUCCESS: {result}")
+            return result
+            
+        except Exception as e:
+            print(f"❌ REAL image test FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": f"Real image test failed: {str(e)}",
+                "method": "real_image",
+                "timestamp": time.time()
+            }
     
-    def generate_frames(self):
-        """Generate frames WITHOUT any DPU communication"""
+    def run(self):
+        """Main debug worker loop"""
+        print("Debug DPU Worker started - testing different data types...")
+        
+        test_count = 0
+        dummy_success = 0
+        real_success = 0
+        
         while True:
             try:
-                if self.is_running and self.cap and self.cap.isOpened():
-                    ret, frame = self.cap.read()
-                    if ret:
-                        self.frame_count += 1
-                        current_time = time.time()
-                        
-                        # NO DPU CALLS AT ALL - just display camera
-                        display_frame = frame.copy()
-                        
-                        # Add overlays
-                        elapsed = current_time - self.start_time
-                        fps = self.frame_count / elapsed if elapsed > 0 else 0
-                        
-                        cv2.putText(display_frame, f"SAFE MODE - FPS: {fps:.1f}", 
-                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        cv2.putText(display_frame, "DPU: DISABLED", 
-                                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        cv2.putText(display_frame, f"Frame: {self.frame_count}", 
-                                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                        cv2.putText(display_frame, "NO SEGFAULT TEST", 
-                                   (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                        
-                        # Encode frame
-                        _, buffer = cv2.imencode('.jpg', display_frame, 
-                                               [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                current_time = time.time()
+                
+                # Check for input every 2 seconds
+                if os.path.exists(self.input_file):
+                    test_count += 1
+                    print(f"\n=== Test {test_count} ===")
+                    
+                    # Alternate between dummy and real data tests
+                    if test_count % 2 == 1:
+                        # Test with dummy data first
+                        result = self.process_with_dummy_data()
+                        if result["success"]:
+                            dummy_success += 1
                     else:
-                        time.sleep(0.1)
-                else:
-                    # Default frame
-                    default_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(default_frame, "SAFE MODE - Camera Not Started", (150, 240), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    _, buffer = cv2.imencode('.jpg', default_frame)
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                        # Test with real image
+                        result = self.process_real_image(self.input_file)
+                        if result["success"]:
+                            real_success += 1
+                    
+                    # Write result
+                    with open(self.result_file, 'w') as f:
+                        json.dump(result, f)
+                    
+                    # Remove input file
+                    try:
+                        os.remove(self.input_file)
+                    except:
+                        pass
+                    
+                    print(f"Statistics: Dummy {dummy_success}/{(test_count+1)//2}, Real {real_success}/{test_count//2}")
                 
-                time.sleep(0.033)  # ~30 FPS
+                time.sleep(2)  # Check every 2 seconds
                 
+            except KeyboardInterrupt:
+                print("Debug DPU Worker stopping...")
+                break
             except Exception as e:
-                print(f"Safe frame generation error: {e}")
-                # Create error frame
-                error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(error_frame, "SAFE MODE ERROR", 
-                           (200, 220), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                cv2.putText(error_frame, str(e)[:30], 
-                           (50, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                _, buffer = cv2.imencode('.jpg', error_frame)
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                print(f"Debug DPU Worker error: {e}")
                 time.sleep(1)
-    
-    def run(self, host='0.0.0.0', port=5000):
-        if not self.start_camera():
-            return
         
-        print(f"🧪 SAFE web streamer: http://{host}:{port}")
-        print("🔴 DPU calls completely DISABLED")
-        print("📹 Camera-only mode for segfault isolation")
-        
-        try:
-            self.app.run(host=host, port=port, debug=False, threaded=True)
-        except KeyboardInterrupt:
-            print("\nSafe web streamer stopping...")
-        finally:
-            self.is_running = False
-            if self.cap:
-                self.cap.release()
+        # Cleanup
+        for f in [self.result_file, self.status_file]:
+            try:
+                os.remove(f)
+            except:
+                pass
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--camera', type=int, default=0)
-    parser.add_argument('--host', default='0.0.0.0')
-    parser.add_argument('--port', type=int, default=5000)
-    
+    parser.add_argument('--model', default='yolox_nano_pt.xmodel')
     args = parser.parse_args()
     
-    streamer = SafeWebStreamer(args.camera)
-    streamer.run(host=args.host, port=args.port)
+    worker = DebugDPUWorker(args.model)
+    worker.run()
