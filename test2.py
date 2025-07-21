@@ -358,51 +358,141 @@ class SingleThreadWebApp:
         return True
     
     def generate_frames(self):
-        """Generate frames with SINGLE-THREADED detection"""
+        """Generate frames with SAFE error handling"""
+        frame_counter = 0
+        
         while True:
-            if self.is_running and self.cap and self.cap.isOpened():
-                ret, frame = self.cap.read()
-                if ret:
-                    self.frame_count += 1
-                    
-                    # Process every 3rd frame to reduce load
-                    if self.frame_count % 3 == 0:
-                        # SINGLE-THREADED detection call
-                        result_frame, success = self.detector.process_single_frame(frame)
+            try:
+                if self.is_running and self.cap and self.cap.isOpened():
+                    ret, frame = self.cap.read()
+                    if ret:
+                        frame_counter += 1
                         
-                        # Add FPS info
-                        elapsed = time.time() - self.start_time
-                        fps = self.frame_count / elapsed if elapsed > 0 else 0
-                        cv2.putText(result_frame, f"FPS: {fps:.1f}", 
-                                   (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                        # Start with simple frame display, add detection gradually
+                        if frame_counter < 10:
+                            # First 10 frames: no detection, just display
+                            display_frame = frame.copy()
+                            cv2.putText(display_frame, "Initializing...", 
+                                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+                            cv2.putText(display_frame, f"Frame: {frame_counter}", 
+                                       (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
                         
-                        with self.frame_lock:
-                            self.current_frame = result_frame
-                    
-                    # Use current processed frame
-                    with self.frame_lock:
-                        if self.current_frame is not None:
-                            display_frame = self.current_frame
+                        elif frame_counter < 20:
+                            # Next 10 frames: test detection but don't fail if error
+                            display_frame = frame.copy()
+                            cv2.putText(display_frame, "Testing detection...", 
+                                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+                            
+                            # Try detection but catch ALL errors
+                            try:
+                                if frame_counter % 5 == 0:  # Test every 5th frame
+                                    print(f"Testing detection on frame {frame_counter}")
+                                    result_frame, success = self.detector.process_single_frame(frame)
+                                    if success:
+                                        display_frame = result_frame
+                                        cv2.putText(display_frame, "Detection OK!", 
+                                                   (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                                    else:
+                                        cv2.putText(display_frame, "Detection Failed", 
+                                                   (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                            except Exception as e:
+                                print(f"Detection test failed: {e}")
+                                cv2.putText(display_frame, f"Error: {str(e)[:20]}", 
+                                           (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        
                         else:
-                            display_frame = frame
-                    
-                    # Encode and yield
-                    _, buffer = cv2.imencode('.jpg', display_frame, 
-                                           [cv2.IMWRITE_JPEG_QUALITY, 80])
+                            # After frame 20: normal operation
+                            self.frame_count += 1
+                            
+                            # Process every 3rd frame to reduce load
+                            if self.frame_count % 3 == 0:
+                                try:
+                                    # SINGLE-THREADED detection call with full error protection
+                                    result_frame, success = self.detector.process_single_frame(frame)
+                                    
+                                    if success:
+                                        # Add FPS info
+                                        elapsed = time.time() - self.start_time
+                                        fps = self.frame_count / elapsed if elapsed > 0 else 0
+                                        cv2.putText(result_frame, f"FPS: {fps:.1f}", 
+                                                   (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                                        
+                                        with self.frame_lock:
+                                            self.current_frame = result_frame
+                                    else:
+                                        # Detection failed, use original frame
+                                        error_frame = frame.copy()
+                                        cv2.putText(error_frame, "Detection Error", 
+                                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                                        with self.frame_lock:
+                                            self.current_frame = error_frame
+                                            
+                                except Exception as e:
+                                    print(f"Critical detection error: {e}")
+                                    # Even if detection completely fails, show original frame
+                                    error_frame = frame.copy()
+                                    cv2.putText(error_frame, "CRITICAL ERROR", 
+                                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                                    cv2.putText(error_frame, str(e)[:30], 
+                                               (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                                    with self.frame_lock:
+                                        self.current_frame = error_frame
+                            
+                            # Use current processed frame
+                            with self.frame_lock:
+                                if self.current_frame is not None:
+                                    display_frame = self.current_frame
+                                else:
+                                    display_frame = frame
+                        
+                        # Encode and yield frame
+                        try:
+                            _, buffer = cv2.imencode('.jpg', display_frame, 
+                                                   [cv2.IMWRITE_JPEG_QUALITY, 80])
+                            yield (b'--frame\r\n'
+                                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                        except Exception as e:
+                            print(f"Frame encoding error: {e}")
+                            # Create emergency frame
+                            emergency_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                            cv2.putText(emergency_frame, "ENCODING ERROR", (200, 240), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                            _, buffer = cv2.imencode('.jpg', emergency_frame)
+                            yield (b'--frame\r\n'
+                                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                    else:
+                        time.sleep(0.1)
+                else:
+                    # Camera not running - show default frame
+                    default_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2.putText(default_frame, "Camera Not Started", (200, 240), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    cv2.putText(default_frame, "Single Thread Mode", (200, 280), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+                    _, buffer = cv2.imencode('.jpg', default_frame)
                     yield (b'--frame\r\n'
                            b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                else:
-                    time.sleep(0.1)
-            else:
-                # Default frame
-                default_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(default_frame, "Camera Not Started", (200, 240), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                _, buffer = cv2.imencode('.jpg', default_frame)
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            
-            time.sleep(0.033)  # ~30 FPS limit
+                
+                time.sleep(0.033)  # ~30 FPS limit
+                
+            except Exception as e:
+                print(f"Generate frames critical error: {e}")
+                # Emergency response - create error frame
+                try:
+                    emergency_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2.putText(emergency_frame, "STREAM ERROR", (200, 220), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    cv2.putText(emergency_frame, str(e)[:40], (50, 260), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    cv2.putText(emergency_frame, "Continuing...", (200, 300), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+                    _, buffer = cv2.imencode('.jpg', emergency_frame)
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                    time.sleep(1)  # Wait before continuing
+                except:
+                    # If even emergency frame fails, just wait
+                    time.sleep(1)
     
     def run(self, host='0.0.0.0', port=5000):
         if not self.start_camera():
