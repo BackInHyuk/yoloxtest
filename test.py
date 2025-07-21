@@ -151,9 +151,6 @@ class YOLOXDetector:
         batch_size, tensor_h, tensor_w, channels = tensor_shape
         self.input_height, self.input_width = tensor_h, tensor_w
         
-        print(f"Input tensor shape: {tensor_shape} (NHWC format)")
-        print(f"Target size: {self.input_width}x{self.input_height}")
-        
         scale = min(self.input_width / img_w, self.input_height / img_h)
         new_w, new_h = int(img_w * scale), int(img_h * scale)
         
@@ -166,14 +163,13 @@ class YOLOXDetector:
         pad_y = (self.input_height - new_h) // 2
         padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
         
-        # For int8 quantized models, keep as uint8 and add batch dimension
-        # No normalization needed - DPU handles quantization internally
-        input_data = padded.astype(np.uint8)  # Keep as uint8 for int8 model
-        input_data = np.expand_dims(input_data, axis=0)   # Add batch dimension -> NHWC
+        # Convert BGR to RGB (if needed)
+        padded = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
         
-        print(f"Preprocessed data shape: {input_data.shape}")
-        print(f"Data type: {input_data.dtype}")
-        print(f"Data range: [{input_data.min()}, {input_data.max()}]")
+        # For Vitis AI int8 models, use int8 data type with proper scaling
+        # Convert to int8 range [-128, 127] from uint8 range [0, 255]
+        input_data = padded.astype(np.int8) - 128
+        input_data = np.expand_dims(input_data, axis=0)   # Add batch dimension -> NHWC
         
         return input_data, scale, pad_x, pad_y
     
