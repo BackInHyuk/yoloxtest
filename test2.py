@@ -21,17 +21,78 @@ def test_alternative_dpu_call():
     print("=== Final DPU Test - Alternative Approach ===")
     
     try:
-        # Load model
+        # Load model with proper XIR API compatibility
         print("Loading model...")
         graph = xir.Graph.deserialize("yolox_nano_pt.xmodel")
         root_subgraph = graph.get_root_subgraph()
         
-        # Get subgraphs
-        subgraphs = root_subgraph.children_topological_sort()
+        # Get subgraphs with proper error handling
+        subgraphs = []
+        try:
+            if hasattr(root_subgraph, 'children_topological_sort'):
+                subgraphs = root_subgraph.children_topological_sort()
+            elif hasattr(root_subgraph, 'get_children'):
+                subgraphs = root_subgraph.get_children()
+            else:
+                print("Using root subgraph directly")
+                subgraphs = [root_subgraph]
+        except Exception as e:
+            print(f"Error getting subgraphs: {e}")
+            subgraphs = [root_subgraph]
         
-        # Use subgraph 2 (confirmed DPU from debug)
-        dpu_subgraph = subgraphs[2]
-        print(f"Using subgraph 2: {dpu_subgraph.get_name()}")
+        if not subgraphs:
+            raise ValueError("No subgraphs found")
+        
+        print(f"Found {len(subgraphs)} subgraphs")
+        
+        # Find DPU subgraph (based on debug - should be index 2)
+        dpu_subgraph = None
+        
+        # Try index 2 first (from debug output)
+        if len(subgraphs) > 2:
+            try:
+                candidate = subgraphs[2]
+                if candidate is not None:
+                    name = candidate.get_name()
+                    print(f"Trying subgraph 2: {name}")
+                    if name != "root":
+                        dpu_subgraph = candidate
+                        print("Selected subgraph 2 as DPU")
+            except Exception as e:
+                print(f"Subgraph 2 failed: {e}")
+        
+        # Fallback to device attribute search
+        if dpu_subgraph is None:
+            for i, sg in enumerate(subgraphs):
+                if sg is None:
+                    continue
+                try:
+                    if sg.has_attr("device"):
+                        device = sg.get_attr("device")
+                        if isinstance(device, str) and device.upper() == "DPU":
+                            dpu_subgraph = sg
+                            print(f"Found DPU subgraph at index {i}")
+                            break
+                except:
+                    continue
+        
+        # Final fallback
+        if dpu_subgraph is None:
+            for i, sg in enumerate(subgraphs):
+                if sg is not None:
+                    try:
+                        name = sg.get_name()
+                        if name != "root":
+                            dpu_subgraph = sg
+                            print(f"Using subgraph {i} as fallback: {name}")
+                            break
+                    except:
+                        continue
+        
+        if dpu_subgraph is None:
+            raise ValueError("No valid DPU subgraph found")
+        
+        print(f"Using DPU subgraph: {dpu_subgraph.get_name()}")
         
         # Create DPU runner
         print("Creating DPU runner...")
