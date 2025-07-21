@@ -140,23 +140,19 @@ class YOLOXDetector:
         return colors
     
     def preprocess(self, image: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
-        """Image preprocessing with proper tensor formatting"""
+        """Image preprocessing with proper tensor formatting for int8 quantized model"""
         img_h, img_w = image.shape[:2]
         
         # Get actual input tensor shape from DPU
         input_tensor = self.input_tensors[0]
         tensor_shape = tuple(input_tensor.dims)
-        print(f"Input tensor shape: {tensor_shape}")
         
-        # Extract dimensions based on tensor format
-        if len(tensor_shape) == 4:
-            # NCHW or NHWC format
-            if tensor_shape[1] == 3:  # NCHW: [N, C, H, W]
-                batch_size, channels, tensor_h, tensor_w = tensor_shape
-                self.input_height, self.input_width = tensor_h, tensor_w
-            else:  # NHWC: [N, H, W, C]
-                batch_size, tensor_h, tensor_w, channels = tensor_shape
-                self.input_height, self.input_width = tensor_h, tensor_w
+        # Extract dimensions - NHWC format: [N, H, W, C]
+        batch_size, tensor_h, tensor_w, channels = tensor_shape
+        self.input_height, self.input_width = tensor_h, tensor_w
+        
+        print(f"Input tensor shape: {tensor_shape} (NHWC format)")
+        print(f"Target size: {self.input_width}x{self.input_height}")
         
         scale = min(self.input_width / img_w, self.input_height / img_h)
         new_w, new_h = int(img_w * scale), int(img_h * scale)
@@ -170,121 +166,119 @@ class YOLOXDetector:
         pad_y = (self.input_height - new_h) // 2
         padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
         
-        # Prepare input data based on tensor format
-        if len(tensor_shape) == 4 and tensor_shape[1] == 3:  # NCHW format
-            # Normalize and transpose to NCHW
-            input_data = padded.astype(np.float32) / 255.0
-            input_data = np.transpose(input_data, (2, 0, 1))  # HWC -> CHW
-            input_data = np.expand_dims(input_data, axis=0)   # Add batch dimension
-        else:  # NHWC format
-            # Keep as NHWC, just normalize and add batch dimension
-            input_data = padded.astype(np.float32) / 255.0
-            input_data = np.expand_dims(input_data, axis=0)   # Add batch dimension
-        
-        # Ensure correct data type and shape
-        input_data = input_data.astype(np.float32)
-        expected_shape = tuple(tensor_shape)
+        # For int8 quantized models, keep as uint8 and add batch dimension
+        # No normalization needed - DPU handles quantization internally
+        input_data = padded.astype(np.uint8)  # Keep as uint8 for int8 model
+        input_data = np.expand_dims(input_data, axis=0)   # Add batch dimension -> NHWC
         
         print(f"Preprocessed data shape: {input_data.shape}")
-        print(f"Expected tensor shape: {expected_shape}")
-        
-        # Reshape if necessary
-        if input_data.shape != expected_shape:
-            print(f"Reshaping from {input_data.shape} to {expected_shape}")
-            input_data = input_data.reshape(expected_shape)
+        print(f"Data type: {input_data.dtype}")
+        print(f"Data range: [{input_data.min()}, {input_data.max()}]")
         
         return input_data, scale, pad_x, pad_y
     
     def postprocess(self, outputs: List[np.ndarray], orig_shape: Tuple[int, int], 
                    scale: float, pad_x: int, pad_y: int) -> List[dict]:
-        """Post-processing and NMS"""
+        """Post-processing for YOLOX multi-scale outputs"""
         try:
-            # Handle different output formats
-            if len(outputs) > 0 and len(outputs[0].shape) >= 2:
-                if len(outputs[0].shape) == 3:
-                    predictions = outputs[0][0]  # Remove batch dimension
+            all_boxes = []
+            all_scores = []
+            all_class_ids = []
+            
+            # YOLOX has 3 output scales: 52x52, 26x26, 13x13
+            # Each output format: [batch, height, width, 85] where 85 = 4(bbox) + 1(obj) + 80(classes)
+            
+            for output_idx, output in enumerate(outputs):
+                if len(output.shape) == 4:
+                    batch_size, grid_h, grid_w, num_anchors = output.shape
+                    output = output[0]  # Remove batch dimension
                 else:
-                    predictions = outputs[0]
-            else:
-                return []
-            
-            boxes = []
-            scores = []
-            class_ids = []
-            
-            # Handle different prediction formats
-            if len(predictions.shape) == 1:
-                # Single prediction case
-                predictions = predictions.reshape(1, -1)
-            
-            for detection in predictions:
-                if len(detection) < 5:
-                    continue
-                    
-                # YOLOX format: [x, y, w, h, objectness, class_scores...]
-                x, y, w, h, objectness = detection[:5]
+                    grid_h, grid_w, num_anchors = output.shape
                 
-                if objectness < self.conf_threshold:
-                    continue
+                print(f"Processing output {output_idx}: shape {output.shape}")
                 
-                # Get class scores
-                if len(detection) > 5:
-                    class_scores = detection[5:]
-                    if len(class_scores) == 0:
-                        continue
-                    
-                    class_id = np.argmax(class_scores)
-                    class_score = class_scores[class_id]
-                    final_score = objectness * class_score
-                else:
-                    # No class scores, use objectness only
-                    class_id = 0
-                    final_score = objectness
-                
-                if final_score < self.conf_threshold:
-                    continue
-                
-                # Convert coordinates
-                x1 = (x - w/2 - pad_x) / scale
-                y1 = (y - h/2 - pad_y) / scale
-                x2 = (x + w/2 - pad_x) / scale
-                y2 = (y + h/2 - pad_y) / scale
-                
-                # Clip to image bounds
-                x1 = max(0, min(x1, orig_shape[1]))
-                y1 = max(0, min(y1, orig_shape[0]))
-                x2 = max(0, min(x2, orig_shape[1]))
-                y2 = max(0, min(y2, orig_shape[0]))
-                
-                if x2 > x1 and y2 > y1:  # Valid box
-                    boxes.append([x1, y1, x2, y2])
-                    scores.append(final_score)
-                    class_ids.append(class_id)
+                # Generate grid
+                for i in range(grid_h):
+                    for j in range(grid_w):
+                        prediction = output[i, j, :]
+                        
+                        if len(prediction) < 85:
+                            continue
+                        
+                        # Extract components
+                        x_center = prediction[0]
+                        y_center = prediction[1] 
+                        width = prediction[2]
+                        height = prediction[3]
+                        objectness = prediction[4]
+                        class_probs = prediction[5:85]  # 80 classes
+                        
+                        if objectness < self.conf_threshold:
+                            continue
+                        
+                        # Get best class
+                        class_id = np.argmax(class_probs)
+                        class_prob = class_probs[class_id]
+                        final_score = objectness * class_prob
+                        
+                        if final_score < self.conf_threshold:
+                            continue
+                        
+                        # Convert to absolute coordinates
+                        # Grid-based coordinate conversion
+                        stride = 416 // grid_h  # 8, 16, or 32
+                        
+                        abs_x = (j + x_center) * stride
+                        abs_y = (i + y_center) * stride
+                        abs_w = np.exp(width) * stride
+                        abs_h = np.exp(height) * stride
+                        
+                        # Convert to corner coordinates
+                        x1 = (abs_x - abs_w/2 - pad_x) / scale
+                        y1 = (abs_y - abs_h/2 - pad_y) / scale
+                        x2 = (abs_x + abs_w/2 - pad_x) / scale
+                        y2 = (abs_y + abs_h/2 - pad_y) / scale
+                        
+                        # Clip to image bounds
+                        x1 = max(0, min(x1, orig_shape[1]))
+                        y1 = max(0, min(y1, orig_shape[0]))
+                        x2 = max(0, min(x2, orig_shape[1]))
+                        y2 = max(0, min(y2, orig_shape[0]))
+                        
+                        if x2 > x1 and y2 > y1:  # Valid box
+                            all_boxes.append([x1, y1, x2, y2])
+                            all_scores.append(final_score)
+                            all_class_ids.append(class_id)
             
             # Apply NMS
-            if len(boxes) > 0:
-                indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf_threshold, self.nms_threshold)
+            if len(all_boxes) > 0:
+                indices = cv2.dnn.NMSBoxes(all_boxes, all_scores, self.conf_threshold, self.nms_threshold)
                 if len(indices) > 0:
                     if isinstance(indices, np.ndarray):
                         indices = indices.flatten()
-                    return [
-                        {
-                            'bbox': boxes[i],
-                            'score': scores[i],
-                            'class_id': class_ids[i],
-                            'class_name': self.class_names[class_ids[i]] if class_ids[i] < len(self.class_names) else f"class_{class_ids[i]}"
-                        }
-                        for i in indices
-                    ]
+                    
+                    detections = []
+                    for i in indices:
+                        detections.append({
+                            'bbox': all_boxes[i],
+                            'score': all_scores[i],
+                            'class_id': all_class_ids[i],
+                            'class_name': self.class_names[all_class_ids[i]] if all_class_ids[i] < len(self.class_names) else f"class_{all_class_ids[i]}"
+                        })
+                    
+                    print(f"Final detections after NMS: {len(detections)}")
+                    return detections
             
             return []
             
         except Exception as e:
             print(f"Postprocessing error: {e}")
+            import traceback
+            traceback.print_exc()
             return []
     
     def detect(self, image: np.ndarray) -> List[dict]:
-        """Perform object detection with proper input handling"""
+        """Perform object detection with proper input handling for int8 model"""
         start_time = time.time()
         
         try:
@@ -293,37 +287,15 @@ class YOLOXDetector:
             # Preprocessing
             input_data, scale, pad_x, pad_y = self.preprocess(image)
             
-            print(f"Input data type: {input_data.dtype}")
-            print(f"Input data shape: {input_data.shape}")
-            print(f"Input data range: [{input_data.min():.3f}, {input_data.max():.3f}]")
-            
             # Create input arrays for DPU
-            input_arrays = []
+            input_arrays = [input_data]  # Single input for YOLOX
             output_arrays = []
             
-            # Prepare input arrays
-            for i, tensor in enumerate(self.input_tensors):
-                # Create array with exact tensor shape and type
-                tensor_shape = tuple(tensor.dims)
-                if i == 0:  # Main input tensor
-                    # Ensure input_data matches tensor requirements
-                    if input_data.shape != tensor_shape:
-                        print(f"Reshaping input data from {input_data.shape} to {tensor_shape}")
-                        input_data = input_data.reshape(tensor_shape)
-                    input_arrays.append(input_data)
-                else:
-                    # Handle additional input tensors if any
-                    dummy_input = np.zeros(tensor_shape, dtype=np.float32)
-                    input_arrays.append(dummy_input)
-            
-            # Prepare output arrays
+            # Prepare output arrays with correct shapes
             for tensor in self.output_tensors:
                 tensor_shape = tuple(tensor.dims)
                 output_array = np.zeros(tensor_shape, dtype=np.float32)
                 output_arrays.append(output_array)
-            
-            print(f"Number of input arrays: {len(input_arrays)}")
-            print(f"Number of output arrays: {len(output_arrays)}")
             
             # DPU inference
             job_id = self.dpu_runner.execute_async(input_arrays, output_arrays)
