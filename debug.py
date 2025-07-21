@@ -47,23 +47,61 @@ class SimpleYOLOXDetector:
             graph = xir.Graph.deserialize(self.model_path)
             root_subgraph = graph.get_root_subgraph()
             
-            # Get subgraphs
+            # Get all subgraphs - based on debug output, we need subgraph 1 (DPU)
             subgraphs = []
             try:
                 if hasattr(root_subgraph, 'children_topological_sort'):
                     subgraphs = root_subgraph.children_topological_sort()
+                elif hasattr(root_subgraph, 'get_children'):
+                    subgraphs = root_subgraph.get_children()
                 else:
                     subgraphs = [root_subgraph]
             except:
                 subgraphs = [root_subgraph]
             
-            # Use subgraph 1 (based on previous debug)
-            if len(subgraphs) > 1:
-                dpu_subgraph = subgraphs[1]
-                print("Using subgraph 1 as DPU")
-            else:
-                dpu_subgraph = subgraphs[0]
-                print("Using subgraph 0 as DPU")
+            print(f"Found {len(subgraphs)} subgraphs:")
+            for i, sg in enumerate(subgraphs):
+                device = "Unknown"
+                if sg.has_attr("device"):
+                    device = sg.get_attr("device")
+                print(f"  Subgraph {i}: {sg.get_name()} (device: {device})")
+            
+            # Based on debug output:
+            # - Subgraph 0: YOLOX__YOLOX_QuantStub_quant_in__input_1_fix (device: CPU) 
+            # - Subgraph 1: YOLOX__YOLOX_YOLOXHead_head__Cat_cat_list__ModuleList_0__inputs_3_fix (device: DPU)
+            
+            dpu_subgraph = None
+            
+            # First, try to find DPU subgraph by device attribute
+            for i, subgraph in enumerate(subgraphs):
+                try:
+                    if subgraph.has_attr("device"):
+                        device = subgraph.get_attr("device")
+                        if isinstance(device, str) and device.upper() == "DPU":
+                            dpu_subgraph = subgraph
+                            print(f"Found DPU subgraph at index {i}")
+                            break
+                except:
+                    continue
+            
+            # If not found by device attribute, use subgraph 1 based on debug output
+            if dpu_subgraph is None:
+                if len(subgraphs) > 1:
+                    dpu_subgraph = subgraphs[1]  # Subgraph 1 is DPU based on debug
+                    print("Using subgraph 1 as DPU (based on debug output)")
+                else:
+                    print("ERROR: Expected at least 2 subgraphs, but found only", len(subgraphs))
+                    exit(1)
+            
+            # Verify this is not the root subgraph
+            if dpu_subgraph.get_name() == "root":
+                print("ERROR: Selected subgraph is 'root' which is not compiled!")
+                print("Available subgraphs:")
+                for i, sg in enumerate(subgraphs):
+                    print(f"  {i}: {sg.get_name()}")
+                exit(1)
+            
+            print(f"Using DPU subgraph: {dpu_subgraph.get_name()}")
             
             # Create DPU runner
             self.dpu_runner = vart.Runner.create_runner(dpu_subgraph, "run")
@@ -76,6 +114,8 @@ class SimpleYOLOXDetector:
             
         except Exception as e:
             print(f"Model loading failed: {e}")
+            import traceback
+            traceback.print_exc()
             exit(1)
     
     def _generate_colors(self, num_classes: int):
