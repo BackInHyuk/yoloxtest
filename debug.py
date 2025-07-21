@@ -43,75 +43,214 @@ class DebugDPUWorker:
         print("Debug DPU Worker ready")
     
     def _load_model(self):
-        """Load DPU model - COMPLETE version from previous success"""
+        """Load DPU model - IMPROVED version with better subgraph detection"""
         try:
-            graph = xir.Graph.deserialize(self.model_path)
-            root_subgraph = graph.get_root_subgraph()
+            print(f"Loading model from: {self.model_path}")
             
+            # Check if model file exists
+            if not os.path.exists(self.model_path):
+                raise FileNotFoundError(f"Model file not found: {self.model_path}")
+            
+            graph = xir.Graph.deserialize(self.model_path)
+            if graph is None:
+                raise ValueError("Failed to deserialize graph")
+            
+            root_subgraph = graph.get_root_subgraph()
             if root_subgraph is None:
                 raise ValueError("Failed to get root subgraph")
             
-            # Get subgraphs with FULL compatibility
-            subgraphs = []
+            print(f"Root subgraph name: {root_subgraph.get_name()}")
+            
+            # Get all subgraphs using multiple methods
+            all_subgraphs = []
+            
+            # Method 1: Get children directly
+            try:
+                children = root_subgraph.get_children()
+                if children:
+                    if isinstance(children, (list, tuple)):
+                        all_subgraphs.extend(children)
+                    else:
+                        all_subgraphs.append(children)
+                    print(f"Found {len(all_subgraphs)} children subgraphs")
+            except Exception as e:
+                print(f"Method 1 failed: {e}")
+            
+            # Method 2: Try topological sort if available
             try:
                 if hasattr(root_subgraph, 'children_topological_sort'):
-                    children = root_subgraph.children_topological_sort()
-                    if isinstance(children, (list, tuple)):
-                        subgraphs = children
-                    elif isinstance(children, set):
-                        subgraphs = list(children)
-                    else:
-                        subgraphs = [children] if children else []
-                else:
-                    subgraphs = [root_subgraph]
-            except:
-                subgraphs = [root_subgraph]
+                    topo_children = root_subgraph.children_topological_sort()
+                    if topo_children:
+                        if isinstance(topo_children, (list, tuple)):
+                            for child in topo_children:
+                                if child not in all_subgraphs:
+                                    all_subgraphs.append(child)
+                        else:
+                            if topo_children not in all_subgraphs:
+                                all_subgraphs.append(topo_children)
+                    print(f"Topological sort added subgraphs, total: {len(all_subgraphs)}")
+            except Exception as e:
+                print(f"Method 2 failed: {e}")
             
-            # Find DPU subgraph with all methods
-            dpu_subgraph = None
+            # Method 3: Include root subgraph itself
+            if root_subgraph not in all_subgraphs:
+                all_subgraphs.append(root_subgraph)
             
-            # Method 1: Device attribute
-            for i, sg in enumerate(subgraphs):
+            print(f"Total subgraphs to check: {len(all_subgraphs)}")
+            
+            # Debug: Print all subgraph info
+            for i, sg in enumerate(all_subgraphs):
                 if sg is None:
                     continue
                 try:
-                    if sg.has_attr("device"):
+                    name = sg.get_name()
+                    print(f"Subgraph {i}: {name}")
+                    
+                    # Check attributes
+                    if hasattr(sg, 'has_attr') and hasattr(sg, 'get_attr'):
+                        if sg.has_attr("device"):
+                            device = sg.get_attr("device")
+                            print(f"  - device: {device}")
+                        if sg.has_attr("op"):
+                            op = sg.get_attr("op")
+                            print(f"  - op: {op}")
+                except Exception as e:
+                    print(f"  - Error getting info: {e}")
+            
+            # Find DPU subgraph with improved methods
+            dpu_subgraph = None
+            
+            # Method A: Check device attribute (most reliable)
+            print("\n=== Searching for DPU subgraph ===")
+            for i, sg in enumerate(all_subgraphs):
+                if sg is None:
+                    continue
+                try:
+                    if hasattr(sg, 'has_attr') and sg.has_attr("device"):
                         device = sg.get_attr("device")
+                        print(f"Subgraph {i} device: {device}")
                         if isinstance(device, str) and device.upper() == "DPU":
                             dpu_subgraph = sg
-                            print(f"Found DPU by device at index {i}")
+                            print(f"✅ Found DPU subgraph by device attribute at index {i}")
                             break
-                except:
+                except Exception as e:
+                    print(f"Error checking device for subgraph {i}: {e}")
                     continue
             
-            # Method 2: Validation test
+            # Method B: Check by name patterns
             if dpu_subgraph is None:
-                for i, sg in enumerate(subgraphs):
+                print("Trying to find DPU by name pattern...")
+                for i, sg in enumerate(all_subgraphs):
+                    if sg is None:
+                        continue
+                    try:
+                        name = sg.get_name().lower()
+                        if 'dpu' in name or 'runner' in name or name != 'root':
+                            print(f"Testing subgraph {i} with name: {sg.get_name()}")
+                            # Try to create runner as test
+                            test_runner = vart.Runner.create_runner(sg, "run")
+                            if test_runner is not None:
+                                dpu_subgraph = sg
+                                print(f"✅ Found DPU subgraph by name/validation at index {i}")
+                                break
+                    except Exception as e:
+                        print(f"Test failed for subgraph {i}: {e}")
+                        continue
+            
+            # Method C: Try all non-root subgraphs
+            if dpu_subgraph is None:
+                print("Trying all non-root subgraphs...")
+                for i, sg in enumerate(all_subgraphs):
                     if sg is None:
                         continue
                     try:
                         name = sg.get_name()
-                        if name != "root":
+                        if name == "root":
+                            continue
+                        print(f"Testing subgraph {i}: {name}")
+                        test_runner = vart.Runner.create_runner(sg, "run")
+                        if test_runner is not None:
+                            dpu_subgraph = sg
+                            print(f"✅ Found DPU subgraph by testing at index {i}")
+                            break
+                    except Exception as e:
+                        print(f"Test failed for subgraph {i}: {e}")
+                        continue
+            
+            # Method D: Last resort - use first available subgraph
+            if dpu_subgraph is None and len(all_subgraphs) > 0:
+                print("Last resort: trying first available subgraph...")
+                for sg in all_subgraphs:
+                    if sg is not None:
+                        try:
                             test_runner = vart.Runner.create_runner(sg, "run")
                             if test_runner is not None:
                                 dpu_subgraph = sg
-                                print(f"Found DPU by validation at index {i}")
+                                print(f"✅ Using first working subgraph: {sg.get_name()}")
                                 break
-                    except:
-                        continue
+                        except:
+                            continue
             
             if dpu_subgraph is None:
-                raise ValueError("No DPU subgraph found")
+                # Print detailed debug info
+                print("\n=== DEBUG INFO ===")
+                print(f"Model path: {self.model_path}")
+                print(f"Graph: {graph}")
+                print(f"Root subgraph: {root_subgraph}")
+                print(f"Total subgraphs found: {len(all_subgraphs)}")
+                
+                for i, sg in enumerate(all_subgraphs):
+                    if sg is None:
+                        print(f"Subgraph {i}: None")
+                        continue
+                    try:
+                        name = sg.get_name()
+                        print(f"Subgraph {i}: {name}")
+                        
+                        # Try to get more attributes
+                        attrs = []
+                        if hasattr(sg, 'has_attr'):
+                            for attr_name in ['device', 'op', 'kernel', 'dpu']:
+                                try:
+                                    if sg.has_attr(attr_name):
+                                        attr_val = sg.get_attr(attr_name)
+                                        attrs.append(f"{attr_name}={attr_val}")
+                                except:
+                                    pass
+                        if attrs:
+                            print(f"  Attributes: {', '.join(attrs)}")
+                    except Exception as e:
+                        print(f"Subgraph {i}: Error - {e}")
+                
+                raise ValueError("No valid DPU subgraph found in model")
             
-            # Create runner
+            # Create runner with the found subgraph
+            print(f"Creating runner with subgraph: {dpu_subgraph.get_name()}")
             self.dpu_runner = vart.Runner.create_runner(dpu_subgraph, "run")
+            
+            if self.dpu_runner is None:
+                raise ValueError("Failed to create DPU runner")
+            
             self.input_tensors = self.dpu_runner.get_input_tensors()
             self.output_tensors = self.dpu_runner.get_output_tensors()
             
-            print("✅ Debug DPU loaded successfully")
+            if not self.input_tensors or not self.output_tensors:
+                raise ValueError("Failed to get input/output tensors")
+            
+            print(f"✅ Debug DPU loaded successfully")
+            print(f"   Input tensors: {len(self.input_tensors)}")
+            print(f"   Output tensors: {len(self.output_tensors)}")
+            
+            # Print tensor info
+            for i, tensor in enumerate(self.input_tensors):
+                print(f"   Input {i}: {tensor.dims}")
+            for i, tensor in enumerate(self.output_tensors):
+                print(f"   Output {i}: {tensor.dims}")
             
         except Exception as e:
-            print(f"Debug DPU model loading failed: {e}")
+            print(f"❌ Debug DPU model loading failed: {e}")
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
     
     def create_dummy_data(self):
