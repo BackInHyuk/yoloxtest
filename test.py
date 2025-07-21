@@ -161,100 +161,158 @@ class YOLOXDetector:
     
     def postprocess(self, outputs: List[np.ndarray], orig_shape: Tuple[int, int], 
                    scale: float, pad_x: int, pad_y: int) -> List[dict]:
-        """Post-processing for YOLOX multi-scale outputs"""
+        """Post-processing for YOLOX multi-scale outputs - SAFE VERSION"""
         try:
             all_boxes = []
             all_scores = []
             all_class_ids = []
             
-            # YOLOX has 3 output scales: 52x52, 26x26, 13x13
-            # Each output format: [batch, height, width, 85] where 85 = 4(bbox) + 1(obj) + 80(classes)
+            print(f"Processing {len(outputs)} outputs")
             
+            # Process each output scale safely
             for output_idx, output in enumerate(outputs):
-                if len(output.shape) == 4:
-                    batch_size, grid_h, grid_w, num_anchors = output.shape
-                    output = output[0]  # Remove batch dimension
-                else:
-                    grid_h, grid_w, num_anchors = output.shape
+                try:
+                    # Safely get output shape
+                    if output is None or output.size == 0:
+                        print(f"Output {output_idx} is empty, skipping")
+                        continue
+                    
+                    output_shape = output.shape
+                    print(f"Output {output_idx} shape: {output_shape}")
+                    
+                    # Handle batch dimension
+                    if len(output_shape) == 4:
+                        batch_size, grid_h, grid_w, num_features = output_shape
+                        if batch_size > 0:
+                            output_data = output[0]  # Take first batch
+                        else:
+                            continue
+                    elif len(output_shape) == 3:
+                        grid_h, grid_w, num_features = output_shape
+                        output_data = output
+                    else:
+                        print(f"Unexpected output shape: {output_shape}")
+                        continue
+                    
+                    # Verify we have the expected 85 features (4 bbox + 1 obj + 80 classes)
+                    if num_features != 85:
+                        print(f"Unexpected number of features: {num_features}, expected 85")
+                        continue
+                    
+                    print(f"Processing grid {grid_h}x{grid_w} with {num_features} features")
+                    
+                    # Calculate stride based on grid size
+                    stride = 416 // grid_h
+                    
+                    # Process grid cells safely
+                    for i in range(min(grid_h, output_data.shape[0])):
+                        for j in range(min(grid_w, output_data.shape[1])):
+                            try:
+                                # Safely access prediction
+                                if i >= output_data.shape[0] or j >= output_data.shape[1]:
+                                    continue
+                                
+                                prediction = output_data[i, j, :]
+                                
+                                if len(prediction) < 85:
+                                    continue
+                                
+                                # Extract components safely
+                                x_center = float(prediction[0])
+                                y_center = float(prediction[1])
+                                width = float(prediction[2])
+                                height = float(prediction[3])
+                                objectness = float(prediction[4])
+                                
+                                # Skip low confidence detections early
+                                if objectness < self.conf_threshold:
+                                    continue
+                                
+                                # Get class probabilities safely
+                                class_probs = prediction[5:85]
+                                if len(class_probs) != 80:
+                                    continue
+                                
+                                # Find best class
+                                class_id = int(np.argmax(class_probs))
+                                class_prob = float(class_probs[class_id])
+                                final_score = objectness * class_prob
+                                
+                                if final_score < self.conf_threshold:
+                                    continue
+                                
+                                # Convert to absolute coordinates with bounds checking
+                                abs_x = (j + x_center) * stride
+                                abs_y = (i + y_center) * stride
+                                
+                                # Limit exponential to prevent overflow
+                                width = np.clip(width, -10, 10)  # Prevent exp overflow
+                                height = np.clip(height, -10, 10)
+                                
+                                abs_w = np.exp(width) * stride
+                                abs_h = np.exp(height) * stride
+                                
+                                # Convert to corner coordinates
+                                x1 = (abs_x - abs_w/2 - pad_x) / scale
+                                y1 = (abs_y - abs_h/2 - pad_y) / scale
+                                x2 = (abs_x + abs_w/2 - pad_x) / scale
+                                y2 = (abs_y + abs_h/2 - pad_y) / scale
+                                
+                                # Clip to image bounds
+                                x1 = max(0, min(x1, orig_shape[1]))
+                                y1 = max(0, min(y1, orig_shape[0]))
+                                x2 = max(0, min(x2, orig_shape[1]))
+                                y2 = max(0, min(y2, orig_shape[0]))
+                                
+                                # Validate box
+                                if x2 > x1 and y2 > y1 and abs_w > 0 and abs_h > 0:
+                                    all_boxes.append([x1, y1, x2, y2])
+                                    all_scores.append(final_score)
+                                    all_class_ids.append(class_id)
+                                
+                            except (IndexError, ValueError) as e:
+                                print(f"Error processing cell [{i},{j}]: {e}")
+                                continue
                 
-                print(f"Processing output {output_idx}: shape {output.shape}")
-                
-                # Generate grid
-                for i in range(grid_h):
-                    for j in range(grid_w):
-                        prediction = output[i, j, :]
-                        
-                        if len(prediction) < 85:
-                            continue
-                        
-                        # Extract components
-                        x_center = prediction[0]
-                        y_center = prediction[1] 
-                        width = prediction[2]
-                        height = prediction[3]
-                        objectness = prediction[4]
-                        class_probs = prediction[5:85]  # 80 classes
-                        
-                        if objectness < self.conf_threshold:
-                            continue
-                        
-                        # Get best class
-                        class_id = np.argmax(class_probs)
-                        class_prob = class_probs[class_id]
-                        final_score = objectness * class_prob
-                        
-                        if final_score < self.conf_threshold:
-                            continue
-                        
-                        # Convert to absolute coordinates
-                        # Grid-based coordinate conversion
-                        stride = 416 // grid_h  # 8, 16, or 32
-                        
-                        abs_x = (j + x_center) * stride
-                        abs_y = (i + y_center) * stride
-                        abs_w = np.exp(width) * stride
-                        abs_h = np.exp(height) * stride
-                        
-                        # Convert to corner coordinates
-                        x1 = (abs_x - abs_w/2 - pad_x) / scale
-                        y1 = (abs_y - abs_h/2 - pad_y) / scale
-                        x2 = (abs_x + abs_w/2 - pad_x) / scale
-                        y2 = (abs_y + abs_h/2 - pad_y) / scale
-                        
-                        # Clip to image bounds
-                        x1 = max(0, min(x1, orig_shape[1]))
-                        y1 = max(0, min(y1, orig_shape[0]))
-                        x2 = max(0, min(x2, orig_shape[1]))
-                        y2 = max(0, min(y2, orig_shape[0]))
-                        
-                        if x2 > x1 and y2 > y1:  # Valid box
-                            all_boxes.append([x1, y1, x2, y2])
-                            all_scores.append(final_score)
-                            all_class_ids.append(class_id)
+                except Exception as e:
+                    print(f"Error processing output {output_idx}: {e}")
+                    continue
             
-            # Apply NMS
+            print(f"Found {len(all_boxes)} candidate detections")
+            
+            # Apply NMS safely
             if len(all_boxes) > 0:
-                indices = cv2.dnn.NMSBoxes(all_boxes, all_scores, self.conf_threshold, self.nms_threshold)
-                if len(indices) > 0:
-                    if isinstance(indices, np.ndarray):
-                        indices = indices.flatten()
+                try:
+                    indices = cv2.dnn.NMSBoxes(all_boxes, all_scores, 
+                                             self.conf_threshold, self.nms_threshold)
                     
-                    detections = []
-                    for i in indices:
-                        detections.append({
-                            'bbox': all_boxes[i],
-                            'score': all_scores[i],
-                            'class_id': all_class_ids[i],
-                            'class_name': self.class_names[all_class_ids[i]] if all_class_ids[i] < len(self.class_names) else f"class_{all_class_ids[i]}"
-                        })
-                    
-                    print(f"Final detections after NMS: {len(detections)}")
-                    return detections
+                    if len(indices) > 0:
+                        if isinstance(indices, np.ndarray):
+                            indices = indices.flatten()
+                        elif isinstance(indices, tuple):
+                            indices = indices[0] if len(indices) > 0 else []
+                        
+                        detections = []
+                        for i in indices:
+                            if 0 <= i < len(all_boxes):  # Bounds check
+                                detections.append({
+                                    'bbox': all_boxes[i],
+                                    'score': all_scores[i],
+                                    'class_id': all_class_ids[i],
+                                    'class_name': self.class_names[all_class_ids[i]] if all_class_ids[i] < len(self.class_names) else f"class_{all_class_ids[i]}"
+                                })
+                        
+                        print(f"Final detections after NMS: {len(detections)}")
+                        return detections
+                
+                except Exception as e:
+                    print(f"NMS error: {e}")
+                    return []
             
             return []
             
         except Exception as e:
-            print(f"Postprocessing error: {e}")
+            print(f"Postprocessing fatal error: {e}")
             import traceback
             traceback.print_exc()
             return []
