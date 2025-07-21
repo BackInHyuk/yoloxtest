@@ -418,6 +418,7 @@ DPU와 완전 분리되어 안전하게 실행
 """
 
 import cv2
+import numpy as np
 import time
 import json
 import os
@@ -863,6 +864,9 @@ if __name__ == "__main__":
 def create_separated_files():
     """Create the separated process files"""
     
+    import os
+    import stat
+    
     # Create dpu_worker.py
     with open("dpu_worker.py", "w") as f:
         f.write(DPU_WORKER_CODE)
@@ -876,7 +880,6 @@ def create_separated_files():
         f.write(RUN_SEPARATED_CODE)
     
     # Make files executable
-    import stat
     for filename in ["dpu_worker.py", "web_streamer.py", "run_separated.py"]:
         st = os.stat(filename)
         os.chmod(filename, st.st_mode | stat.S_IEXEC)
