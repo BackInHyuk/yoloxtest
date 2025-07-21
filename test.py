@@ -140,8 +140,24 @@ class YOLOXDetector:
         return colors
     
     def preprocess(self, image: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
-        """Image preprocessing"""
+        """Image preprocessing with proper tensor formatting"""
         img_h, img_w = image.shape[:2]
+        
+        # Get actual input tensor shape from DPU
+        input_tensor = self.input_tensors[0]
+        tensor_shape = tuple(input_tensor.dims)
+        print(f"Input tensor shape: {tensor_shape}")
+        
+        # Extract dimensions based on tensor format
+        if len(tensor_shape) == 4:
+            # NCHW or NHWC format
+            if tensor_shape[1] == 3:  # NCHW: [N, C, H, W]
+                batch_size, channels, tensor_h, tensor_w = tensor_shape
+                self.input_height, self.input_width = tensor_h, tensor_w
+            else:  # NHWC: [N, H, W, C]
+                batch_size, tensor_h, tensor_w, channels = tensor_shape
+                self.input_height, self.input_width = tensor_h, tensor_w
+        
         scale = min(self.input_width / img_w, self.input_height / img_h)
         new_w, new_h = int(img_w * scale), int(img_h * scale)
         
@@ -154,10 +170,28 @@ class YOLOXDetector:
         pad_y = (self.input_height - new_h) // 2
         padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
         
-        # Normalize and transpose
-        input_data = padded.astype(np.float32) / 255.0
-        input_data = np.transpose(input_data, (2, 0, 1))  # HWC -> CHW
-        input_data = np.expand_dims(input_data, axis=0)   # Add batch dimension
+        # Prepare input data based on tensor format
+        if len(tensor_shape) == 4 and tensor_shape[1] == 3:  # NCHW format
+            # Normalize and transpose to NCHW
+            input_data = padded.astype(np.float32) / 255.0
+            input_data = np.transpose(input_data, (2, 0, 1))  # HWC -> CHW
+            input_data = np.expand_dims(input_data, axis=0)   # Add batch dimension
+        else:  # NHWC format
+            # Keep as NHWC, just normalize and add batch dimension
+            input_data = padded.astype(np.float32) / 255.0
+            input_data = np.expand_dims(input_data, axis=0)   # Add batch dimension
+        
+        # Ensure correct data type and shape
+        input_data = input_data.astype(np.float32)
+        expected_shape = tuple(tensor_shape)
+        
+        print(f"Preprocessed data shape: {input_data.shape}")
+        print(f"Expected tensor shape: {expected_shape}")
+        
+        # Reshape if necessary
+        if input_data.shape != expected_shape:
+            print(f"Reshaping from {input_data.shape} to {expected_shape}")
+            input_data = input_data.reshape(expected_shape)
         
         return input_data, scale, pad_x, pad_y
     
@@ -250,7 +284,7 @@ class YOLOXDetector:
             return []
     
     def detect(self, image: np.ndarray) -> List[dict]:
-        """Perform object detection"""
+        """Perform object detection with proper input handling"""
         start_time = time.time()
         
         try:
@@ -259,12 +293,44 @@ class YOLOXDetector:
             # Preprocessing
             input_data, scale, pad_x, pad_y = self.preprocess(image)
             
+            print(f"Input data type: {input_data.dtype}")
+            print(f"Input data shape: {input_data.shape}")
+            print(f"Input data range: [{input_data.min():.3f}, {input_data.max():.3f}]")
+            
+            # Create input arrays for DPU
+            input_arrays = []
+            output_arrays = []
+            
+            # Prepare input arrays
+            for i, tensor in enumerate(self.input_tensors):
+                # Create array with exact tensor shape and type
+                tensor_shape = tuple(tensor.dims)
+                if i == 0:  # Main input tensor
+                    # Ensure input_data matches tensor requirements
+                    if input_data.shape != tensor_shape:
+                        print(f"Reshaping input data from {input_data.shape} to {tensor_shape}")
+                        input_data = input_data.reshape(tensor_shape)
+                    input_arrays.append(input_data)
+                else:
+                    # Handle additional input tensors if any
+                    dummy_input = np.zeros(tensor_shape, dtype=np.float32)
+                    input_arrays.append(dummy_input)
+            
+            # Prepare output arrays
+            for tensor in self.output_tensors:
+                tensor_shape = tuple(tensor.dims)
+                output_array = np.zeros(tensor_shape, dtype=np.float32)
+                output_arrays.append(output_array)
+            
+            print(f"Number of input arrays: {len(input_arrays)}")
+            print(f"Number of output arrays: {len(output_arrays)}")
+            
             # DPU inference
-            job_id = self.dpu_runner.execute_async([input_data], [])
-            outputs = self.dpu_runner.wait(job_id)
+            job_id = self.dpu_runner.execute_async(input_arrays, output_arrays)
+            self.dpu_runner.wait(job_id)
             
             # Post-processing
-            detections = self.postprocess(outputs, orig_shape, scale, pad_x, pad_y)
+            detections = self.postprocess(output_arrays, orig_shape, scale, pad_x, pad_y)
             
             # Update statistics
             self.inference_time = time.time() - start_time
@@ -274,6 +340,8 @@ class YOLOXDetector:
             
         except Exception as e:
             print(f"Detection error: {e}")
+            import traceback
+            traceback.print_exc()
             self.inference_time = time.time() - start_time
             self.detection_count = 0
             return []
