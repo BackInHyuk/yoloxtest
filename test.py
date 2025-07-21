@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-KV260 YOLOX 웹캠 실시간 검출 with 웹 스트리밍
-호스트 PC에서 http://board_ip:5000 으로 접속하여 스트림 확인 가능
+KV260 YOLOX Webcam Real-time Detection with Web Streaming
+Access from host PC: http://board_ip:5000
 """
 
 import cv2
@@ -13,80 +13,125 @@ from flask import Flask, Response, render_template_string
 from typing import List, Tuple, Optional
 import json
 
-# Vitis AI DPU 런타임 임포트
+# Vitis AI DPU runtime imports
 try:
     import vart
     import xir
 except ImportError:
-    print("Vitis AI 런타임이 설치되지 않았습니다.")
+    print("Vitis AI runtime not installed.")
     exit(1)
 
 class YOLOXDetector:
     def __init__(self, model_path: str, classes_file: str):
-        """YOLOX 검출기 초기화"""
+        """Initialize YOLOX detector"""
         self.model_path = model_path
         self.input_width = 416
         self.input_height = 416
         self.conf_threshold = 0.3
         self.nms_threshold = 0.45
         
-        # 클래스 이름 로드
+        # Load class names
         self.class_names = self._load_classes(classes_file)
         
-        # DPU 모델 로드
+        # Load DPU model
         self._load_model()
         
-        # 색상 팔레트 생성
+        # Generate color palette
         self.colors = self._generate_colors(len(self.class_names))
         
-        # 통계 정보
+        # Statistics
         self.fps = 0
         self.inference_time = 0
         self.detection_count = 0
     
     def _load_classes(self, classes_file: str) -> List[str]:
-        """클래스 이름 파일 로드"""
+        """Load class names file"""
         try:
             with open(classes_file, 'r') as f:
                 classes = [line.strip() for line in f.readlines()]
-            print(f"로드된 클래스 수: {len(classes)}")
+            print(f"Loaded classes: {len(classes)}")
             return classes
         except FileNotFoundError:
-            print(f"클래스 파일을 찾을 수 없습니다: {classes_file}")
-            return [f"class_{i}" for i in range(80)]  # COCO 기본 80클래스
+            print(f"Class file not found: {classes_file}")
+            return [f"class_{i}" for i in range(80)]  # COCO default 80 classes
     
     def _load_model(self):
-        """DPU 모델 로드"""
+        """Load DPU model with compatibility fix"""
         try:
-            # xmodel 로드
+            # Load xmodel
             graph = xir.Graph.deserialize(self.model_path)
-            subgraphs = graph.get_root_subgraph().children_topological_sort()
             
-            # DPU 서브그래프 찾기
+            # Get root subgraph
+            root_subgraph = graph.get_root_subgraph()
+            
+            # Try different methods to get subgraphs (compatibility fix)
+            subgraphs = []
+            try:
+                # New API
+                if hasattr(root_subgraph, 'children_topological_sort'):
+                    subgraphs = root_subgraph.children_topological_sort()
+                elif hasattr(root_subgraph, 'get_children'):
+                    # Alternative API
+                    subgraphs = root_subgraph.get_children()
+                elif hasattr(root_subgraph, 'children'):
+                    # Direct children access
+                    subgraphs = root_subgraph.children
+                else:
+                    # Fallback: use root subgraph directly
+                    subgraphs = [root_subgraph]
+            except AttributeError as e:
+                print(f"Subgraph API error: {e}")
+                # Use root subgraph as fallback
+                subgraphs = [root_subgraph]
+            
+            # Find DPU subgraph
             dpu_subgraph = None
             for subgraph in subgraphs:
-                if subgraph.has_attr("device") and subgraph.get_attr("device").upper() == "DPU":
-                    dpu_subgraph = subgraph
-                    break
+                try:
+                    if subgraph.has_attr("device"):
+                        device_attr = subgraph.get_attr("device")
+                        if isinstance(device_attr, str) and device_attr.upper() == "DPU":
+                            dpu_subgraph = subgraph
+                            break
+                        elif hasattr(device_attr, 'upper') and device_attr.upper() == "DPU":
+                            dpu_subgraph = subgraph
+                            break
+                except:
+                    continue
             
+            # If no DPU subgraph found, try using the first subgraph
             if dpu_subgraph is None:
-                raise RuntimeError("DPU 서브그래프를 찾을 수 없습니다.")
+                print("DPU subgraph not found, using first available subgraph")
+                if subgraphs:
+                    dpu_subgraph = subgraphs[0]
+                else:
+                    dpu_subgraph = root_subgraph
             
-            # DPU 런너 생성
+            # Create DPU runner
             self.dpu_runner = vart.Runner.create_runner(dpu_subgraph, "run")
             
-            # 입력/출력 텐서 정보 가져오기
+            # Get input/output tensor info
             self.input_tensors = self.dpu_runner.get_input_tensors()
             self.output_tensors = self.dpu_runner.get_output_tensors()
             
-            print("DPU 모델 로드 완료")
+            print("DPU model loaded successfully")
+            print(f"Input tensors: {len(self.input_tensors)}")
+            print(f"Output tensors: {len(self.output_tensors)}")
+            
+            # Print tensor shapes for debugging
+            for i, tensor in enumerate(self.input_tensors):
+                print(f"Input {i}: {tensor.name}, shape: {tensor.dims}")
+            for i, tensor in enumerate(self.output_tensors):
+                print(f"Output {i}: {tensor.name}, shape: {tensor.dims}")
             
         except Exception as e:
-            print(f"모델 로드 실패: {e}")
+            print(f"Model loading failed: {e}")
+            import traceback
+            traceback.print_exc()
             exit(1)
     
     def _generate_colors(self, num_classes: int) -> List[Tuple[int, int, int]]:
-        """클래스별 색상 생성"""
+        """Generate colors for each class"""
         colors = []
         for i in range(num_classes):
             hue = int(180 * i / num_classes)
@@ -95,110 +140,146 @@ class YOLOXDetector:
         return colors
     
     def preprocess(self, image: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
-        """이미지 전처리"""
+        """Image preprocessing"""
         img_h, img_w = image.shape[:2]
         scale = min(self.input_width / img_w, self.input_height / img_h)
         new_w, new_h = int(img_w * scale), int(img_h * scale)
         
-        # 리사이즈
+        # Resize
         resized = cv2.resize(image, (new_w, new_h))
         
-        # 패딩 추가
+        # Add padding
         padded = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
         pad_x = (self.input_width - new_w) // 2
         pad_y = (self.input_height - new_h) // 2
         padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
         
-        # 정규화 및 차원 변경
+        # Normalize and transpose
         input_data = padded.astype(np.float32) / 255.0
         input_data = np.transpose(input_data, (2, 0, 1))  # HWC -> CHW
-        input_data = np.expand_dims(input_data, axis=0)   # 배치 차원 추가
+        input_data = np.expand_dims(input_data, axis=0)   # Add batch dimension
         
         return input_data, scale, pad_x, pad_y
     
     def postprocess(self, outputs: List[np.ndarray], orig_shape: Tuple[int, int], 
                    scale: float, pad_x: int, pad_y: int) -> List[dict]:
-        """후처리 및 NMS"""
-        predictions = outputs[0][0]
-        
-        boxes = []
-        scores = []
-        class_ids = []
-        
-        for detection in predictions:
-            if len(detection) < 5:
-                continue
+        """Post-processing and NMS"""
+        try:
+            # Handle different output formats
+            if len(outputs) > 0 and len(outputs[0].shape) >= 2:
+                if len(outputs[0].shape) == 3:
+                    predictions = outputs[0][0]  # Remove batch dimension
+                else:
+                    predictions = outputs[0]
+            else:
+                return []
+            
+            boxes = []
+            scores = []
+            class_ids = []
+            
+            # Handle different prediction formats
+            if len(predictions.shape) == 1:
+                # Single prediction case
+                predictions = predictions.reshape(1, -1)
+            
+            for detection in predictions:
+                if len(detection) < 5:
+                    continue
+                    
+                # YOLOX format: [x, y, w, h, objectness, class_scores...]
+                x, y, w, h, objectness = detection[:5]
                 
-            x, y, w, h, objectness = detection[:5]
-            class_scores = detection[5:]
+                if objectness < self.conf_threshold:
+                    continue
+                
+                # Get class scores
+                if len(detection) > 5:
+                    class_scores = detection[5:]
+                    if len(class_scores) == 0:
+                        continue
+                    
+                    class_id = np.argmax(class_scores)
+                    class_score = class_scores[class_id]
+                    final_score = objectness * class_score
+                else:
+                    # No class scores, use objectness only
+                    class_id = 0
+                    final_score = objectness
+                
+                if final_score < self.conf_threshold:
+                    continue
+                
+                # Convert coordinates
+                x1 = (x - w/2 - pad_x) / scale
+                y1 = (y - h/2 - pad_y) / scale
+                x2 = (x + w/2 - pad_x) / scale
+                y2 = (y + h/2 - pad_y) / scale
+                
+                # Clip to image bounds
+                x1 = max(0, min(x1, orig_shape[1]))
+                y1 = max(0, min(y1, orig_shape[0]))
+                x2 = max(0, min(x2, orig_shape[1]))
+                y2 = max(0, min(y2, orig_shape[0]))
+                
+                if x2 > x1 and y2 > y1:  # Valid box
+                    boxes.append([x1, y1, x2, y2])
+                    scores.append(final_score)
+                    class_ids.append(class_id)
             
-            if objectness < self.conf_threshold:
-                continue
+            # Apply NMS
+            if len(boxes) > 0:
+                indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf_threshold, self.nms_threshold)
+                if len(indices) > 0:
+                    if isinstance(indices, np.ndarray):
+                        indices = indices.flatten()
+                    return [
+                        {
+                            'bbox': boxes[i],
+                            'score': scores[i],
+                            'class_id': class_ids[i],
+                            'class_name': self.class_names[class_ids[i]] if class_ids[i] < len(self.class_names) else f"class_{class_ids[i]}"
+                        }
+                        for i in indices
+                    ]
             
-            class_id = np.argmax(class_scores)
-            class_score = class_scores[class_id]
-            final_score = objectness * class_score
+            return []
             
-            if final_score < self.conf_threshold:
-                continue
-            
-            # 좌표 변환
-            x1 = (x - w/2 - pad_x) / scale
-            y1 = (y - h/2 - pad_y) / scale
-            x2 = (x + w/2 - pad_x) / scale
-            y2 = (y + h/2 - pad_y) / scale
-            
-            # 경계 확인
-            x1 = max(0, min(x1, orig_shape[1]))
-            y1 = max(0, min(y1, orig_shape[0]))
-            x2 = max(0, min(x2, orig_shape[1]))
-            y2 = max(0, min(y2, orig_shape[0]))
-            
-            boxes.append([x1, y1, x2, y2])
-            scores.append(final_score)
-            class_ids.append(class_id)
-        
-        # NMS 적용
-        if len(boxes) > 0:
-            indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf_threshold, self.nms_threshold)
-            if len(indices) > 0:
-                indices = indices.flatten()
-                return [
-                    {
-                        'bbox': boxes[i],
-                        'score': scores[i],
-                        'class_id': class_ids[i],
-                        'class_name': self.class_names[class_ids[i]] if class_ids[i] < len(self.class_names) else f"class_{class_ids[i]}"
-                    }
-                    for i in indices
-                ]
-        
-        return []
+        except Exception as e:
+            print(f"Postprocessing error: {e}")
+            return []
     
     def detect(self, image: np.ndarray) -> List[dict]:
-        """객체 검출 수행"""
+        """Perform object detection"""
         start_time = time.time()
         
-        orig_shape = image.shape[:2]
-        
-        # 전처리
-        input_data, scale, pad_x, pad_y = self.preprocess(image)
-        
-        # DPU 추론
-        job_id = self.dpu_runner.execute_async([input_data], [])
-        outputs = self.dpu_runner.wait(job_id)
-        
-        # 후처리
-        detections = self.postprocess(outputs, orig_shape, scale, pad_x, pad_y)
-        
-        # 통계 업데이트
-        self.inference_time = time.time() - start_time
-        self.detection_count = len(detections)
-        
-        return detections
+        try:
+            orig_shape = image.shape[:2]
+            
+            # Preprocessing
+            input_data, scale, pad_x, pad_y = self.preprocess(image)
+            
+            # DPU inference
+            job_id = self.dpu_runner.execute_async([input_data], [])
+            outputs = self.dpu_runner.wait(job_id)
+            
+            # Post-processing
+            detections = self.postprocess(outputs, orig_shape, scale, pad_x, pad_y)
+            
+            # Update statistics
+            self.inference_time = time.time() - start_time
+            self.detection_count = len(detections)
+            
+            return detections
+            
+        except Exception as e:
+            print(f"Detection error: {e}")
+            self.inference_time = time.time() - start_time
+            self.detection_count = 0
+            return []
     
     def draw_detections(self, image: np.ndarray, detections: List[dict]) -> np.ndarray:
-        """검출 결과를 이미지에 그리기"""
+        """Draw detection results on image"""
         result_image = image.copy()
         
         for detection in detections:
@@ -210,10 +291,10 @@ class YOLOXDetector:
             x1, y1, x2, y2 = map(int, bbox)
             color = self.colors[class_id % len(self.colors)]
             
-            # 바운딩 박스
+            # Draw bounding box
             cv2.rectangle(result_image, (x1, y1), (x2, y2), color, 2)
             
-            # 라벨
+            # Draw label
             label = f"{class_name}: {score:.2f}"
             label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
             
@@ -234,20 +315,20 @@ class WebStreamer:
         self.is_running = False
         self.lock = threading.Lock()
         
-        # Flask 앱 초기화
+        # Initialize Flask app
         self.app = Flask(__name__)
         self.setup_routes()
         
-        # FPS 계산용
+        # FPS calculation
         self.frame_count = 0
         self.start_time = time.time()
     
     def setup_routes(self):
-        """Flask 라우트 설정"""
+        """Setup Flask routes"""
         
         @self.app.route('/')
         def index():
-            """메인 페이지"""
+            """Main page"""
             return render_template_string('''
 <!DOCTYPE html>
 <html>
@@ -349,7 +430,7 @@ class WebStreamer:
     </div>
 
     <script>
-        // 통계 업데이트
+        // Update statistics
         function updateStats() {
             fetch('/stats')
                 .then(response => response.json())
@@ -379,9 +460,9 @@ class WebStreamer:
             updateStats();
         }
         
-        // 주기적으로 통계 업데이트
+        // Update statistics periodically
         setInterval(updateStats, 1000);
-        updateStats(); // 초기 로드
+        updateStats(); // Initial load
     </script>
 </body>
 </html>
@@ -389,13 +470,13 @@ class WebStreamer:
         
         @self.app.route('/video_feed')
         def video_feed():
-            """비디오 스트림 제공"""
+            """Provide video stream"""
             return Response(self.generate_frames(),
                            mimetype='multipart/x-mixed-replace; boundary=frame')
         
         @self.app.route('/stats')
         def stats():
-            """통계 정보 API"""
+            """Statistics API"""
             current_time = time.time()
             elapsed_time = current_time - self.start_time
             fps = self.frame_count / elapsed_time if elapsed_time > 0 else 0
@@ -410,7 +491,7 @@ class WebStreamer:
         
         @self.app.route('/toggle', methods=['POST'])
         def toggle():
-            """스트림 토글"""
+            """Toggle stream"""
             if self.is_running:
                 self.stop_camera()
             else:
@@ -419,7 +500,7 @@ class WebStreamer:
         
         @self.app.route('/snapshot')
         def snapshot():
-            """현재 프레임 스냅샷"""
+            """Current frame snapshot"""
             with self.lock:
                 if self.result_frame is not None:
                     _, buffer = cv2.imencode('.jpg', self.result_frame)
@@ -427,16 +508,16 @@ class WebStreamer:
             return "No frame available", 404
     
     def start_camera(self):
-        """카메라 시작"""
+        """Start camera"""
         if self.is_running:
             return
         
         self.cap = cv2.VideoCapture(self.camera_id)
         if not self.cap.isOpened():
-            print(f"카메라 {self.camera_id}를 열 수 없습니다.")
+            print(f"Cannot open camera {self.camera_id}")
             return
         
-        # 카메라 설정
+        # Camera settings
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
@@ -445,18 +526,18 @@ class WebStreamer:
         self.frame_count = 0
         self.start_time = time.time()
         
-        print("카메라 시작됨")
+        print("Camera started")
     
     def stop_camera(self):
-        """카메라 중지"""
+        """Stop camera"""
         self.is_running = False
         if self.cap:
             self.cap.release()
             self.cap = None
-        print("카메라 중지됨")
+        print("Camera stopped")
     
     def generate_frames(self):
-        """프레임 생성기"""
+        """Frame generator"""
         while True:
             with self.lock:
                 if self.result_frame is not None:
@@ -466,7 +547,7 @@ class WebStreamer:
                     yield (b'--frame\r\n'
                            b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
                 else:
-                    # 기본 이미지 생성
+                    # Generate default image
                     default_frame = np.zeros((480, 640, 3), dtype=np.uint8)
                     cv2.putText(default_frame, "Camera Not Started", (200, 240), 
                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
@@ -477,18 +558,18 @@ class WebStreamer:
             time.sleep(0.033)  # ~30 FPS
     
     def process_frames(self):
-        """프레임 처리 스레드"""
+        """Frame processing thread"""
         while True:
             if self.is_running and self.cap and self.cap.isOpened():
                 ret, frame = self.cap.read()
                 if ret:
-                    # 검출 수행
+                    # Perform detection
                     detections = self.detector.detect(frame)
                     
-                    # 결과 그리기
+                    # Draw results
                     result_frame = self.detector.draw_detections(frame, detections)
                     
-                    # 정보 오버레이
+                    # Add info overlay
                     current_time = time.time()
                     elapsed_time = current_time - self.start_time
                     fps = self.frame_count / elapsed_time if elapsed_time > 0 else 0
@@ -511,42 +592,42 @@ class WebStreamer:
                 time.sleep(0.1)
     
     def run(self, host='0.0.0.0', port=5000):
-        """웹 서버 실행"""
-        # 프레임 처리 스레드 시작
+        """Run web server"""
+        # Start frame processing thread
         processing_thread = threading.Thread(target=self.process_frames, daemon=True)
         processing_thread.start()
         
-        # 카메라 자동 시작
+        # Auto-start camera
         self.start_camera()
         
-        print(f"웹 서버 시작: http://{host}:{port}")
-        print("Ctrl+C로 종료")
+        print(f"Web server starting: http://{host}:{port}")
+        print("Press Ctrl+C to exit")
         
         try:
             self.app.run(host=host, port=port, debug=False, threaded=True)
         except KeyboardInterrupt:
-            print("\n서버 종료 중...")
+            print("\nShutting down server...")
         finally:
             self.stop_camera()
 
 def main():
-    parser = argparse.ArgumentParser(description='KV260 YOLOX 웹 스트리밍 검출기')
-    parser.add_argument('--model', default='yolox_nano_pt.xmodel', help='YOLOX 모델 파일')
-    parser.add_argument('--classes', default='coco2017_classes.txt', help='클래스 파일')
-    parser.add_argument('--camera', type=int, default=0, help='카메라 장치 번호')
-    parser.add_argument('--host', default='0.0.0.0', help='웹 서버 호스트')
-    parser.add_argument('--port', type=int, default=5000, help='웹 서버 포트')
+    parser = argparse.ArgumentParser(description='KV260 YOLOX Web Streaming Detector')
+    parser.add_argument('--model', default='yolox_nano_pt.xmodel', help='YOLOX model file')
+    parser.add_argument('--classes', default='coco2017_classes.txt', help='Class names file')
+    parser.add_argument('--camera', type=int, default=0, help='Camera device number')
+    parser.add_argument('--host', default='0.0.0.0', help='Web server host')
+    parser.add_argument('--port', type=int, default=5000, help='Web server port')
     
     args = parser.parse_args()
     
-    # YOLOX 검출기 초기화
-    print("YOLOX 검출기 초기화 중...")
+    # Initialize YOLOX detector
+    print("Initializing YOLOX detector...")
     detector = YOLOXDetector(args.model, args.classes)
     
-    # 웹 스트리머 초기화
+    # Initialize web streamer
     streamer = WebStreamer(detector, args.camera)
     
-    # 웹 서버 실행
+    # Run web server
     streamer.run(host=args.host, port=args.port)
 
 if __name__ == "__main__":
