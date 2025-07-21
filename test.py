@@ -60,51 +60,46 @@ class YOLOXDetector:
         try:
             # Load xmodel
             graph = xir.Graph.deserialize(self.model_path)
-            
-            # Get root subgraph
             root_subgraph = graph.get_root_subgraph()
             
-            # Try different methods to get subgraphs (compatibility fix)
+            # Get subgraphs with proper method selection
             subgraphs = []
             try:
-                # New API
                 if hasattr(root_subgraph, 'children_topological_sort'):
                     subgraphs = root_subgraph.children_topological_sort()
                 elif hasattr(root_subgraph, 'get_children'):
-                    # Alternative API
                     subgraphs = root_subgraph.get_children()
-                elif hasattr(root_subgraph, 'children'):
-                    # Direct children access
-                    subgraphs = root_subgraph.children
                 else:
-                    # Fallback: use root subgraph directly
                     subgraphs = [root_subgraph]
-            except AttributeError as e:
-                print(f"Subgraph API error: {e}")
-                # Use root subgraph as fallback
+            except AttributeError:
                 subgraphs = [root_subgraph]
             
-            # Find DPU subgraph
+            print(f"Found {len(subgraphs)} subgraphs")
+            
+            # Find DPU subgraph (based on debug output, should be subgraph 1)
             dpu_subgraph = None
-            for subgraph in subgraphs:
+            for i, subgraph in enumerate(subgraphs):
                 try:
+                    print(f"Checking subgraph {i}: {subgraph.get_name()}")
                     if subgraph.has_attr("device"):
                         device_attr = subgraph.get_attr("device")
+                        print(f"  Device: {device_attr}")
                         if isinstance(device_attr, str) and device_attr.upper() == "DPU":
                             dpu_subgraph = subgraph
+                            print(f"  -> Selected subgraph {i} as DPU")
                             break
-                        elif hasattr(device_attr, 'upper') and device_attr.upper() == "DPU":
-                            dpu_subgraph = subgraph
-                            break
-                except:
+                except Exception as e:
+                    print(f"  Error checking subgraph {i}: {e}")
                     continue
             
-            # If no DPU subgraph found, try using the first subgraph
+            # Fallback: based on debug output, subgraph 1 is the DPU subgraph
             if dpu_subgraph is None:
-                print("DPU subgraph not found, using first available subgraph")
-                if subgraphs:
-                    dpu_subgraph = subgraphs[0]
+                print("DPU subgraph not found by device attribute, trying subgraph 1...")
+                if len(subgraphs) > 1:
+                    dpu_subgraph = subgraphs[1]
+                    print("Using subgraph 1 as DPU (based on debug output)")
                 else:
+                    print("Using root subgraph as fallback")
                     dpu_subgraph = root_subgraph
             
             # Create DPU runner
@@ -143,13 +138,8 @@ class YOLOXDetector:
         """Image preprocessing with proper tensor formatting for int8 quantized model"""
         img_h, img_w = image.shape[:2]
         
-        # Get actual input tensor shape from DPU
-        input_tensor = self.input_tensors[0]
-        tensor_shape = tuple(input_tensor.dims)
-        
-        # Extract dimensions - NHWC format: [N, H, W, C]
-        batch_size, tensor_h, tensor_w, channels = tensor_shape
-        self.input_height, self.input_width = tensor_h, tensor_w
+        # Use fixed input size from model
+        self.input_height, self.input_width = 416, 416
         
         scale = min(self.input_width / img_w, self.input_height / img_h)
         new_w, new_h = int(img_w * scale), int(img_h * scale)
@@ -163,12 +153,8 @@ class YOLOXDetector:
         pad_y = (self.input_height - new_h) // 2
         padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
         
-        # Convert BGR to RGB (if needed)
-        padded = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        
-        # For Vitis AI int8 models, use int8 data type with proper scaling
-        # Convert to int8 range [-128, 127] from uint8 range [0, 255]
-        input_data = padded.astype(np.int8) - 128
+        # Convert to int8 format (subtract 128 from uint8)
+        input_data = (padded.astype(np.int16) - 128).astype(np.int8)
         input_data = np.expand_dims(input_data, axis=0)   # Add batch dimension -> NHWC
         
         return input_data, scale, pad_x, pad_y
