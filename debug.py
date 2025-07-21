@@ -19,104 +19,115 @@ def test_yolox_simple():
     
     # Load model
     graph = xir.Graph.deserialize(model_path)
-    subgraphs = []
-    
     root_subgraph = graph.get_root_subgraph()
+    
+    # Get subgraphs
+    subgraphs = []
     try:
         if hasattr(root_subgraph, 'children_topological_sort'):
             subgraphs = root_subgraph.children_topological_sort()
+        elif hasattr(root_subgraph, 'get_children'):
+            subgraphs = root_subgraph.get_children()
         else:
             subgraphs = [root_subgraph]
     except:
         subgraphs = [root_subgraph]
     
-    # Find DPU subgraph
+    print(f"Found {len(subgraphs)} subgraphs")
+    
+    # Find DPU subgraph (from debug, it should be subgraph 1)
     dpu_subgraph = None
-    for subgraph in subgraphs:
+    for i, subgraph in enumerate(subgraphs):
+        print(f"Subgraph {i}: {subgraph.get_name()}")
         if subgraph.has_attr("device"):
             device = subgraph.get_attr("device")
+            print(f"  Device: {device}")
             if isinstance(device, str) and device.upper() == "DPU":
                 dpu_subgraph = subgraph
+                print(f"  -> Selected as DPU subgraph")
                 break
     
     if dpu_subgraph is None:
-        dpu_subgraph = subgraphs[0]
+        print("No DPU subgraph found, trying subgraph 1...")
+        if len(subgraphs) > 1:
+            dpu_subgraph = subgraphs[1]  # Based on debug output, subgraph 1 is DPU
+        else:
+            print("ERROR: No suitable subgraph found")
+            return False
     
     # Create runner
-    dpu_runner = vart.Runner.create_runner(dpu_subgraph, "run")
+    try:
+        dpu_runner = vart.Runner.create_runner(dpu_subgraph, "run")
+    except Exception as e:
+        print(f"Failed to create runner: {e}")
+        return False
+        
     input_tensors = dpu_runner.get_input_tensors()
     output_tensors = dpu_runner.get_output_tensors()
     
     print("=== Tensor Information ===")
     for i, tensor in enumerate(input_tensors):
         print(f"Input {i}: {tensor.name}, shape: {tensor.dims}, dtype: {tensor.dtype}")
+    for i, tensor in enumerate(output_tensors):
+        print(f"Output {i}: {tensor.name}, shape: {tensor.dims}, dtype: {tensor.dtype}")
     
-    # Test different data types
+    # Test with known working format from debug
     input_shape = tuple(input_tensors[0].dims)  # (1, 416, 416, 3)
     
-    test_cases = [
-        ("uint8 [0,255]", lambda: np.random.randint(0, 256, input_shape, dtype=np.uint8)),
-        ("int8 [-128,127]", lambda: np.random.randint(-128, 128, input_shape, dtype=np.int8)),
-        ("float32 [0,1]", lambda: np.random.rand(*input_shape).astype(np.float32)),
-        ("float32 [0,255]", lambda: (np.random.rand(*input_shape) * 255).astype(np.float32)),
-        ("real image uint8", lambda: create_real_image_uint8(input_shape)),
-        ("real image int8", lambda: create_real_image_int8(input_shape)),
-    ]
-    
-    for test_name, data_generator in test_cases:
-        print(f"\n=== Testing: {test_name} ===")
+    print(f"\n=== Testing with int8 format (based on debug) ===")
+    try:
+        # Create test image - use the format that worked in debug
+        # Debug showed: Data range: [0.000, 1.000] with float32, but model expects xint8
+        
+        # Method 1: Create image data as int8 directly
+        input_data = np.random.randint(-128, 127, input_shape, dtype=np.int8)
+        
+        print(f"Data shape: {input_data.shape}")
+        print(f"Data type: {input_data.dtype}")
+        print(f"Data range: [{input_data.min()}, {input_data.max()}]")
+        
+        # Prepare outputs
+        output_arrays = []
+        for tensor in output_tensors:
+            output_arrays.append(np.zeros(tuple(tensor.dims), dtype=np.float32))
+        
+        # Test inference
+        job_id = dpu_runner.execute_async([input_data], output_arrays)
+        dpu_runner.wait(job_id)
+        
+        print(f"✓ SUCCESS with int8")
+        
+        # Check outputs
+        for i, output in enumerate(output_arrays):
+            print(f"  Output {i}: shape={output.shape}, range=[{output.min():.6f}, {output.max():.6f}]")
+        
+        return True
+        
+    except Exception as e:
+        print(f"✗ FAILED with int8: {e}")
+        
+        # Try alternative: uint8 converted to proper range
         try:
-            # Generate test data
-            input_data = data_generator()
+            print(f"\n=== Testing with uint8 converted to int8 ===")
+            # Create realistic image data
+            temp_image = np.random.randint(0, 256, (416, 416, 3), dtype=np.uint8)
+            # Convert to int8 range
+            input_data = (temp_image.astype(np.int16) - 128).astype(np.int8)
+            input_data = np.expand_dims(input_data, axis=0)
+            
             print(f"Data shape: {input_data.shape}")
             print(f"Data type: {input_data.dtype}")
             print(f"Data range: [{input_data.min()}, {input_data.max()}]")
             
-            # Prepare outputs
-            output_arrays = []
-            for tensor in output_tensors:
-                output_arrays.append(np.zeros(tuple(tensor.dims), dtype=np.float32))
-            
-            # Test inference
             job_id = dpu_runner.execute_async([input_data], output_arrays)
             dpu_runner.wait(job_id)
             
-            print(f"✓ SUCCESS: {test_name}")
+            print(f"✓ SUCCESS with uint8->int8 conversion")
+            return True
             
-            # Check outputs
-            for i, output in enumerate(output_arrays):
-                print(f"  Output {i}: shape={output.shape}, range=[{output.min():.6f}, {output.max():.6f}]")
-            
-            return True  # Found working data type
-            
-        except Exception as e:
-            print(f"✗ FAILED: {test_name} - {e}")
-            continue
-    
-    return False
-
-def create_real_image_uint8(shape):
-    """Create a real-looking image in uint8 format"""
-    # Create a synthetic image
-    _, h, w, c = shape
-    image = np.zeros((h, w, c), dtype=np.uint8)
-    
-    # Add some patterns
-    image[:, :, 0] = 128  # Red channel
-    image[:, :, 1] = 64   # Green channel  
-    image[:, :, 2] = 192  # Blue channel
-    
-    # Add some noise
-    noise = np.random.randint(0, 50, (h, w, c), dtype=np.uint8)
-    image = np.clip(image.astype(np.int16) + noise.astype(np.int16), 0, 255).astype(np.uint8)
-    
-    return np.expand_dims(image, axis=0)
-
-def create_real_image_int8(shape):
-    """Create a real-looking image in int8 format"""
-    uint8_image = create_real_image_uint8(shape)
-    # Convert to int8 by subtracting 128
-    return (uint8_image.astype(np.int16) - 128).astype(np.int8)
+        except Exception as e2:
+            print(f"✗ FAILED with uint8->int8: {e2}")
+            return False
 
 if __name__ == "__main__":
     success = test_yolox_simple()
@@ -124,3 +135,4 @@ if __name__ == "__main__":
         print("\n=== SUCCESS: Found working data format ===")
     else:
         print("\n=== FAILED: No working data format found ===")
+        print("Check if DPU is properly loaded and model is correctly compiled")
