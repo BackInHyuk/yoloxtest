@@ -212,10 +212,12 @@ def main():
     parser.add_argument('--model', default='yolox_nano_pt.xmodel')
     parser.add_argument('--classes', default='coco2017_classes.txt')
     parser.add_argument('--camera', type=int, default=0)
+    parser.add_argument('--save-images', action='store_true', help='Save test images')
     args = parser.parse_args()
     
     print("=== Simple YOLOX Detection Test ===")
     print("This is a minimal test without Flask or threading")
+    print("Running in headless mode (no GUI)")
     
     # Initialize detector
     detector = SimpleYOLOXDetector(args.model, args.classes)
@@ -229,12 +231,14 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
-    print("Press 'q' to quit, 's' to save frame")
+    print("Running detection test...")
+    print("Press Ctrl+C to quit")
     
     frame_count = 0
+    success_count = 0
     
     try:
-        while True:
+        for test_frame in range(50):  # Test 50 frames
             ret, frame = cap.read()
             if not ret:
                 print("Cannot read frame")
@@ -242,34 +246,38 @@ def main():
             
             frame_count += 1
             
-            # Run detection every 10 frames to avoid overload
-            if frame_count % 10 == 0:
+            # Run detection every 5 frames to avoid overload
+            if frame_count % 5 == 0:
                 print(f"\n--- Frame {frame_count} ---")
                 success, detection_count = detector.detect(frame)
                 
-                # Draw info
-                result_frame = detector.draw_simple_info(frame, success, detection_count)
+                if success:
+                    success_count += 1
+                    print(f"✓ Detection successful - Found: {detection_count}")
+                else:
+                    print("✗ Detection failed")
+                
+                # Save image if requested
+                if args.save_images:
+                    result_frame = detector.draw_simple_info(frame, success, detection_count)
+                    filename = f'test_frame_{frame_count}.jpg'
+                    cv2.imwrite(filename, result_frame)
+                    print(f"Saved {filename}")
             else:
-                result_frame = frame.copy()
-                cv2.putText(result_frame, f"Frame {frame_count} (processing every 10th)", 
-                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                print(f"Frame {frame_count} (skipped)")
             
-            # Show frame
-            cv2.imshow('Simple YOLOX Test', result_frame)
-            
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('s'):
-                cv2.imwrite(f'frame_{frame_count}.jpg', result_frame)
-                print(f"Saved frame_{frame_count}.jpg")
+            # Small delay to prevent overload
+            time.sleep(0.1)
     
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     
     finally:
         cap.release()
-        cv2.destroyAllWindows()
+        print(f"\n=== Test Results ===")
+        print(f"Total frames processed: {frame_count}")
+        print(f"Successful detections: {success_count}")
+        print(f"Success rate: {success_count/max(1, frame_count//5)*100:.1f}%")
         print("Test completed")
 
 if __name__ == "__main__":
