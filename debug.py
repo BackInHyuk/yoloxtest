@@ -23,6 +23,11 @@ class SimpleYOLOXDetector:
         self.conf_threshold = 0.3
         self.nms_threshold = 0.45
         
+        # Initialize as None for safe cleanup
+        self.dpu_runner = None
+        self.input_tensors = None
+        self.output_tensors = None
+        
         # Load class names
         self.class_names = self._load_classes(classes_file)
         
@@ -31,6 +36,16 @@ class SimpleYOLOXDetector:
         
         # Generate colors
         self.colors = self._generate_colors(len(self.class_names))
+    
+    def __del__(self):
+        """Safe cleanup when object is destroyed"""
+        try:
+            if hasattr(self, 'dpu_runner') and self.dpu_runner is not None:
+                print("Cleaning up DPU runner...")
+                # Don't explicitly delete - let Python handle it
+                self.dpu_runner = None
+        except:
+            pass  # Ignore cleanup errors
     
     def _load_classes(self, classes_file: str):
         try:
@@ -213,32 +228,38 @@ def main():
     parser.add_argument('--classes', default='coco2017_classes.txt')
     parser.add_argument('--camera', type=int, default=0)
     parser.add_argument('--save-images', action='store_true', help='Save test images')
+    parser.add_argument('--frames', type=int, default=10, help='Number of frames to test')
     args = parser.parse_args()
     
     print("=== Simple YOLOX Detection Test ===")
     print("This is a minimal test without Flask or threading")
     print("Running in headless mode (no GUI)")
     
-    # Initialize detector
-    detector = SimpleYOLOXDetector(args.model, args.classes)
-    
-    # Initialize camera
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        print("Cannot open camera")
-        return
-    
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    
-    print("Running detection test...")
-    print("Press Ctrl+C to quit")
-    
-    frame_count = 0
-    success_count = 0
+    detector = None
+    cap = None
     
     try:
-        for test_frame in range(50):  # Test 50 frames
+        # Initialize detector
+        print("Initializing detector...")
+        detector = SimpleYOLOXDetector(args.model, args.classes)
+        
+        # Initialize camera
+        print("Initializing camera...")
+        cap = cv2.VideoCapture(args.camera)
+        if not cap.isOpened():
+            print("Cannot open camera")
+            return
+        
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        print(f"Running detection test for {args.frames} frames...")
+        print("Press Ctrl+C to quit early")
+        
+        frame_count = 0
+        success_count = 0
+        
+        for test_frame in range(args.frames):
             ret, frame = cap.read()
             if not ret:
                 print("Cannot read frame")
@@ -246,39 +267,61 @@ def main():
             
             frame_count += 1
             
-            # Run detection every 5 frames to avoid overload
-            if frame_count % 5 == 0:
-                print(f"\n--- Frame {frame_count} ---")
-                success, detection_count = detector.detect(frame)
-                
-                if success:
-                    success_count += 1
-                    print(f"✓ Detection successful - Found: {detection_count}")
-                else:
-                    print("✗ Detection failed")
-                
-                # Save image if requested
-                if args.save_images:
-                    result_frame = detector.draw_simple_info(frame, success, detection_count)
-                    filename = f'test_frame_{frame_count}.jpg'
-                    cv2.imwrite(filename, result_frame)
-                    print(f"Saved {filename}")
+            # Run detection every frame for this test
+            print(f"\n--- Frame {frame_count}/{args.frames} ---")
+            success, detection_count = detector.detect(frame)
+            
+            if success:
+                success_count += 1
+                print(f"✓ Detection successful - Found: {detection_count}")
             else:
-                print(f"Frame {frame_count} (skipped)")
+                print("✗ Detection failed")
+            
+            # Save image if requested
+            if args.save_images and success:
+                result_frame = detector.draw_simple_info(frame, success, detection_count)
+                filename = f'test_frame_{frame_count}.jpg'
+                cv2.imwrite(filename, result_frame)
+                print(f"Saved {filename}")
             
             # Small delay to prevent overload
-            time.sleep(0.1)
-    
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    
-    finally:
-        cap.release()
+            time.sleep(0.5)
+        
         print(f"\n=== Test Results ===")
         print(f"Total frames processed: {frame_count}")
         print(f"Successful detections: {success_count}")
-        print(f"Success rate: {success_count/max(1, frame_count//5)*100:.1f}%")
-        print("Test completed")
+        if frame_count > 0:
+            print(f"Success rate: {success_count/frame_count*100:.1f}%")
+        print("Test completed successfully!")
+    
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    except Exception as e:
+        print(f"Test error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        # Safe cleanup
+        print("Cleaning up resources...")
+        
+        if cap is not None:
+            try:
+                cap.release()
+                print("Camera released")
+            except:
+                pass
+        
+        if detector is not None:
+            try:
+                # Clear references to help with cleanup
+                detector.dpu_runner = None
+                detector = None
+                print("Detector cleaned up")
+            except:
+                pass
+        
+        print("Cleanup completed - exiting safely")
 
 if __name__ == "__main__":
     main()
